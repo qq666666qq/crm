@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Text, Integer, DateTime, ForeignKey, ForeignKeyConstraint, UniqueConstraint, Index, func
+from sqlalchemy import String, Text, Integer, BigInteger, DateTime, ForeignKey, ForeignKeyConstraint, UniqueConstraint, Index, CheckConstraint, func
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
@@ -23,16 +23,23 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True)
     name: Mapped[str] = mapped_column(String(255))
     password_hash: Mapped[str] = mapped_column(Text)
+    verification_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    verification_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reset_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    reset_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failed_logins: Mapped[int] = mapped_column(Integer, default=0, server_default='0')
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), default='active')
 
 
 class Membership(Base):
     __tablename__ = 'tenant_memberships'
-    __table_args__ = (UniqueConstraint('tenant_id', 'user_id'),)
+    __table_args__ = (UniqueConstraint('tenant_id', 'user_id'), ForeignKeyConstraint(['tenant_id', 'manager_id'], ['tenant_memberships.tenant_id', 'tenant_memberships.user_id']), CheckConstraint('manager_id IS NULL OR manager_id <> user_id', name='ck_membership_not_self'))
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uid)
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('tenants.id'))
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('users.id'))
     role: Mapped[str] = mapped_column(String(20))
+    manager_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
     status: Mapped[str] = mapped_column(String(20), default='active')
 
 
@@ -122,3 +129,16 @@ class Idempotency(Base):
     request_hash: Mapped[str] = mapped_column(String(64))
     status_code: Mapped[int] = mapped_column(Integer)
     response: Mapped[dict] = mapped_column(JSONB)
+
+
+class OutboxEvent(Base):
+    __tablename__ = 'crm_outbox_events'
+    __table_args__ = (Index('ix_outbox_tenant_id', 'tenant_id', 'id'), Index('ix_outbox_created_at', 'created_at'))
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('tenants.id'))
+    entity: Mapped[str] = mapped_column(String(50))
+    entity_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    action: Mapped[str] = mapped_column(String(30))
+    version: Mapped[int | None] = mapped_column(Integer)
+    changes: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

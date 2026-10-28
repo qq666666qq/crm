@@ -14,7 +14,30 @@ class Login(Strict):
     password: str = Field(min_length=1, max_length=1024)
 
 
+class Register(Strict):
+    email: EmailStr
+    name: str = Field(min_length=1, max_length=255)
+    tenant_id: uuid.UUID
+
+class VerifyRegistration(Strict):
+    code: str = Field(min_length=32, max_length=256)
+    password: str = Field(min_length=12, max_length=1024)
+
+class ResetRequest(Strict):
+    email: EmailStr
+
+class ResetPassword(VerifyRegistration):
+    pass
+
+class ChangePassword(Strict):
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: str = Field(min_length=12, max_length=1024)
+
+class JoinRequest(Strict):
+    tenant_id: uuid.UUID
+
 class MemberCreate(Strict):
+    manager_id: uuid.UUID | None = None
     email: EmailStr
     name: str = Field(min_length=1, max_length=255)
     password: str = Field(min_length=12, max_length=1024)
@@ -22,6 +45,7 @@ class MemberCreate(Strict):
 
 
 class MemberPatch(Strict):
+    manager_id: uuid.UUID | None = None
     role: Literal['admin', 'manager', 'sales'] | None = None
     status: Literal['active', 'inactive'] | None = None
 

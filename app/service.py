@@ -7,7 +7,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.errors import error
-from app.models import AuditLog, Company, Contact, Idempotency, Membership
+from app.models import AuditLog, Company, Contact, Idempotency, Membership, User
 from app.schemas import ContactFields
 
 
@@ -24,9 +24,16 @@ def lock_company_name(db, tenant_id, name):
     db.execute(text('SELECT pg_advisory_xact_lock(:id)'), {'id': lock_id})
 
 
+def scope_ids(p):
+    if p.membership.role == 'sales': return select(Membership.user_id).where(Membership.tenant_id == p.membership.tenant_id, Membership.user_id == p.user.id)
+    tree = select(Membership.user_id).where(Membership.tenant_id == p.membership.tenant_id, Membership.user_id == p.user.id, Membership.status == 'active').cte(recursive=True)
+    tree = tree.union(select(Membership.user_id).join(tree, Membership.manager_id == tree.c.user_id).where(Membership.tenant_id == p.membership.tenant_id, Membership.role != 'admin'))
+    return select(tree.c.user_id)
+
+
 def company_query(p):
     q = select(Company).where(Company.tenant_id == p.membership.tenant_id, Company.deleted_at.is_(None))
-    if p.membership.role == 'sales': q = q.where(Company.owner_id == p.user.id)
+    if p.membership.role != 'admin': q = q.where(Company.owner_id.in_(scope_ids(p)))
     return q
 
 
@@ -40,7 +47,7 @@ def get_company(db, p, id, lock=False):
 
 def get_contact(db, p, id, lock=False):
     q = select(Contact).join(Company, (Contact.company_id == Company.id) & (Contact.tenant_id == Company.tenant_id)).where(Contact.id == id, Contact.tenant_id == p.membership.tenant_id, Contact.deleted_at.is_(None), Company.deleted_at.is_(None))
-    if p.membership.role == 'sales': q = q.where(Company.owner_id == p.user.id)
+    if p.membership.role != 'admin': q = q.where(Company.owner_id.in_(scope_ids(p)))
     if lock: q = q.with_for_update(of=(Company, Contact))
     obj = db.scalar(q)
     if not obj: raise error(404, 'NOT_FOUND', 'Contact not found')
@@ -52,13 +59,30 @@ def output(obj):
     return jsonable_encoder({column.name: getattr(obj, column.name) for column in obj.__table__.columns if column.name != 'website_domain'}, custom_encoder={Decimal: str})
 
 
-def audit(db, p, request, action, obj, fields):
+def output_with_owner(db, p, objects):
+    """Only expose names of owners of already-authorized records in this tenant."""
+    objects = list(objects)
+    ids = {getattr(obj, 'owner_id', None) or getattr(obj, 'assigned_to', None) for obj in objects}
+    ids.discard(None)
+    names = dict(db.execute(select(User.id, User.name).join(Membership, Membership.user_id == User.id).where(Membership.tenant_id == p.membership.tenant_id, User.id.in_(ids))).all()) if ids else {}
+    result = []
+    for obj in objects:
+        item = output(obj)
+        owner_id = getattr(obj, 'owner_id', None) or getattr(obj, 'assigned_to', None)
+        if owner_id: item['owner_name'] = names.get(owner_id)
+        result.append(item)
+    return result
+
+
+def audit(db, p, request, action, obj, fields, changes=None):
     db.add(AuditLog(tenant_id=p.membership.tenant_id, actor_id=p.user.id, action=action, object_type=obj.__tablename__, object_id=obj.id, changed_fields=list(fields), request_id=request.state.request_id, source=request.headers.get('X-Operation-Source', 'human') if request.headers.get('X-Operation-Source', 'human') in ('human', 'agent') else 'human', agent_run_id=(request.headers.get('X-Agent-Run-ID') or '')[:100] or None))
+    from app.outbox import emit
+    emit(db, obj, action, changes)
 
 
 def owner(db, p, owner_id):
     owner_id = owner_id or p.user.id
-    if p.membership.role == 'sales' and owner_id != p.user.id: raise error(403, 'FORBIDDEN', 'Sales can only own their own companies')
+    if p.membership.role != 'admin' and not db.scalar(select(Membership.user_id).where(Membership.user_id == owner_id, Membership.user_id.in_(scope_ids(p)))): raise error(403, 'FORBIDDEN', 'Owner is outside your management scope')
     if not db.scalar(select(Membership.id).where(Membership.tenant_id == p.membership.tenant_id, Membership.user_id == owner_id, Membership.status == 'active')): raise error(422, 'VALIDATION_ERROR', 'Owner must be an active tenant member')
     return owner_id
 
@@ -83,7 +107,7 @@ def write(db: Session, p, request, key, operation, replay_check=None, replay_aut
             target_id = prior.response.get('id')
             company_id = prior.response.get('company_id') or target_id
             q = select(Company).where(Company.id == company_id, Company.tenant_id == p.membership.tenant_id)
-            if p.membership.role == 'sales': q = q.where(Company.owner_id == p.user.id)
+            if p.membership.role != 'admin': q = q.where(Company.owner_id.in_(scope_ids(p)))
             if not db.scalar(q): raise error(404, 'NOT_FOUND', 'Record not found')
         return prior.response, prior.status_code
     try:
@@ -136,23 +160,24 @@ def modify(db, p, request, obj, values, delete=False):
         try: ContactFields(**merged)
         except Exception: raise error(422, 'VALIDATION_ERROR', 'Contact must have a name and a valid contact channel')
     if delete: values['deleted_at'] = datetime.now(timezone.utc)
+    changes = {key: {'old': getattr(obj, key), 'new': value} for key, value in values.items() if getattr(obj, key) != value}
     for key, value in values.items(): setattr(obj, key, value)
     obj.version += 1
     obj.updated_by = p.user.id
     db.flush()
     db.refresh(obj)
-    audit(db, p, request, 'delete' if delete else 'update', obj, values.keys())
+    audit(db, p, request, 'delete' if delete else 'update', obj, values.keys(), changes)
     return output(obj), 200
 
 
 def restore(db, p, request, model, id, expected):
     if model is Company:
         q = select(Company).where(Company.id == id, Company.tenant_id == p.membership.tenant_id, Company.deleted_at.is_not(None))
-        if p.membership.role == 'sales': q = q.where(Company.owner_id == p.user.id)
+        if p.membership.role != 'admin': q = q.where(Company.owner_id.in_(scope_ids(p)))
         obj = db.scalar(q.with_for_update())
     else:
         q = select(Contact).join(Company, (Contact.company_id == Company.id) & (Contact.tenant_id == Company.tenant_id)).where(Contact.id == id, Contact.tenant_id == p.membership.tenant_id, Contact.deleted_at.is_not(None), Company.deleted_at.is_(None))
-        if p.membership.role == 'sales': q = q.where(Company.owner_id == p.user.id)
+        if p.membership.role != 'admin': q = q.where(Company.owner_id.in_(scope_ids(p)))
         obj = db.scalar(q.with_for_update(of=(Company, Contact)))
     if not obj: raise error(404, 'NOT_FOUND', 'Deleted record not found or parent inactive')
     if obj.version != expected: raise error(409, 'VERSION_CONFLICT', 'Record has changed')

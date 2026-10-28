@@ -1,4 +1,6 @@
 import uuid
+import asyncio
+import weakref
 from datetime import datetime, timezone
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
@@ -8,15 +10,26 @@ from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException
 from app.database import get_db
 from app.errors import error
-from app.models import Company, Contact, Membership, User, AuditLog
-from app.schemas import CompanyFields, CompanyPatch, ContactFields, ContactPatch, Login, MemberCreate, MemberPatch, MemberAttach, Restore
-from app.security import login, principal
+from app.models import Company, Contact, Membership, User, AuditLog, Tenant
+from app.schemas import CompanyFields, CompanyPatch, ContactFields, ContactPatch, Login, MemberCreate, MemberPatch, MemberAttach, Restore, Register, VerifyRegistration, ResetRequest, ResetPassword, ChangePassword, JoinRequest
+from app.security import login, principal, authenticated
 from app import service
-from app import members
+from app import members, accounts
 from app.sales_api import router as sales_router
+from app.sync import router as sync_router
 
 app = FastAPI(title='B2B CRM API', version='1.0.0')
 app.include_router(sales_router)
+app.include_router(sync_router)
+
+# Bound ordinary requests before they enter synchronous database dependencies.
+# This leaves pool capacity for the shared sync monitor and event delivery.
+request_slots = weakref.WeakKeyDictionary()
+
+def slots_for_current_loop():
+    loop = asyncio.get_running_loop()
+    if loop not in request_slots: request_slots[loop] = asyncio.Semaphore(8)
+    return request_slots[loop]
 
 
 def audit_failure(request, result):
@@ -42,7 +55,11 @@ def audit_failure(request, result):
 async def request_context(request: Request, call_next):
     request.state.request_id = str(uuid.uuid4())
     request.state.body = await request.body()
-    response = await call_next(request)
+    if request.url.path == '/api/v1/sync/events':
+        response = await call_next(request)
+    else:
+        async with slots_for_current_loop():
+            response = await call_next(request)
     response.headers['X-Request-ID'] = request.state.request_id
     return response
 
@@ -77,14 +94,46 @@ def auth_login(data: Login, db: Session = Depends(get_db)):
     return {'access_token': login(db, str(data.email), data.password), 'token_type': 'bearer'}
 
 
+@app.post('/api/v1/auth/register')
+def auth_register(data: Register, request: Request, db: Session = Depends(get_db)):
+    return accounts.register(db, request, data)
+
+@app.post('/api/v1/auth/register/verify')
+def auth_verify(data: VerifyRegistration, request: Request, db: Session = Depends(get_db)):
+    return accounts.verify(db, request, data)
+
+@app.post('/api/v1/auth/password/reset-request')
+def auth_reset_request(data: ResetRequest, request: Request, db: Session = Depends(get_db)):
+    return accounts.request_reset(db, request, data)
+
+@app.post('/api/v1/auth/password/reset')
+def auth_reset(data: ResetPassword, request: Request, db: Session = Depends(get_db)):
+    return accounts.reset(db, request, data)
+
+@app.post('/api/v1/auth/password/change')
+def auth_change_password(data: ChangePassword, request: Request, identity=Depends(authenticated), db: Session = Depends(get_db)):
+    return accounts.change_password(db, request, identity, data)
+
+@app.post('/api/v1/auth/join')
+def auth_join(data: JoinRequest, request: Request, identity=Depends(authenticated), db: Session = Depends(get_db)):
+    return accounts.join(db, request, identity, data)
+
 @app.get('/api/v1/auth/me')
 def me(p=Depends(principal)):
-    return {'user_id': str(p.user.id), 'email': p.user.email, 'name': p.user.name, 'tenant_id': str(p.membership.tenant_id), 'role': p.membership.role}
+    return {'user_id': str(p.user.id), 'email': p.user.email, 'name': p.user.name, 'tenant_id': str(p.membership.tenant_id), 'role': p.membership.role, 'permissions': {'manage_members': p.membership.role in ('admin','manager'), 'manage_approvals': p.membership.role in ('admin','manager')}}
+
+
+@app.get('/api/v1/auth/tenants')
+def auth_tenants(identity=Depends(authenticated), db: Session = Depends(get_db)):
+    user, _ = identity
+    rows = db.execute(select(Tenant, Membership).join(Membership, Membership.tenant_id == Tenant.id).where(Membership.user_id == user.id, Membership.status == 'active', Tenant.status == 'active').order_by(Tenant.name))
+    return {'items': [{'id': str(tenant.id), 'name': tenant.name, 'role': member.role} for tenant, member in rows]}
 
 
 @app.post('/api/v1/auth/logout')
-def logout(p=Depends(principal), db: Session = Depends(get_db)):
-    p.session.revoked_at = datetime.now(timezone.utc)
+def logout(identity=Depends(authenticated), db: Session = Depends(get_db)):
+    _, session = identity
+    session.revoked_at = datetime.now(timezone.utc)
     db.commit()
     return {'status': 'logged_out'}
 
@@ -96,15 +145,21 @@ def response(result):
 
 @app.get('/api/v1/members')
 def list_members(p=Depends(principal), db: Session = Depends(get_db)):
-    members.require_admin(db, p)
-    rows = db.execute(select(Membership, User).join(User, User.id == Membership.user_id).where(Membership.tenant_id == p.membership.tenant_id).order_by(User.email))
+    members.require_manager(db, p)
+    query = select(Membership, User).join(User, User.id == Membership.user_id).where(Membership.tenant_id == p.membership.tenant_id)
+    if p.membership.role != 'admin': query = query.where(Membership.user_id.in_(service.scope_ids(p)), ((Membership.status != 'pending') | (Membership.manager_id == p.user.id)))
+    rows = db.execute(query.order_by(User.email))
     return {'items': [members.serialize(member, user) for member, user in rows]}
 
 
 @app.post('/api/v1/members')
 def create_member(data: MemberCreate, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)):
-    members.require_admin(db, p)
-    return response(service.write(db, p, request, key, lambda: members.create(db, p, request, data), lambda: members.require_admin(db, p, True)))
+    members.require_manager(db, p)
+    def replay(result):
+        members.require_manager(db, p, True)
+        member = db.get(Membership, uuid.UUID(result['id']))
+        if not member or not members.can_manage(db, p, member): raise error(403, 'FORBIDDEN', 'Member is outside your management scope')
+    return response(service.write(db, p, request, key, lambda: members.create(db, p, request, data), replay_authorize=replay))
 
 
 @app.post('/api/v1/members/attach')
@@ -115,8 +170,12 @@ def attach_member(data: MemberAttach, request: Request, key: str | None = Header
 
 @app.patch('/api/v1/members/{id}')
 def update_member(id: uuid.UUID, data: MemberPatch, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)):
-    members.require_admin(db, p)
-    return response(service.write(db, p, request, key, lambda: members.modify(db, p, request, id, data), lambda: members.require_admin(db, p, True)))
+    members.require_manager(db, p)
+    def replay(result):
+        members.require_manager(db, p, True)
+        member = db.get(Membership, id)
+        if not member or not members.can_manage(db, p, member): raise error(403, 'FORBIDDEN', 'Member is outside your management scope')
+    return response(service.write(db, p, request, key, lambda: members.modify(db, p, request, id, data), replay_authorize=replay))
 
 
 @app.post('/api/v1/companies/{id}/restore')
@@ -130,11 +189,13 @@ def restore_contact(id: uuid.UUID, data: Restore, request: Request, key: str | N
 
 
 @app.get('/api/v1/companies')
-def companies(q: str = '', limit: int = 50, offset: int = 0, p=Depends(principal), db: Session = Depends(get_db)):
+def companies(q: str = '', limit: int = 50, offset: int = 0, country: str | None = None, industry: str | None = None, p=Depends(principal), db: Session = Depends(get_db)):
     if not 1 <= limit <= 100 or offset < 0: raise error(422, 'VALIDATION_ERROR', 'Invalid pagination')
     query = service.company_query(p)
+    if country: query = query.where(Company.country == country)
+    if industry: query = query.where(Company.industry == industry)
     if q: query = query.where(Company.name.ilike('%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%', escape='\\'))
-    return {'items': [service.output(x) for x in db.scalars(query.order_by(Company.created_at, Company.id).limit(limit).offset(offset))]}
+    return {'items': service.output_with_owner(db, p, db.scalars(query.order_by(Company.created_at, Company.id).limit(limit).offset(offset)))}
 
 
 @app.get('/api/v1/companies/duplicates')
@@ -153,7 +214,7 @@ def create_company(data: CompanyFields, request: Request, key: str | None = Head
 
 @app.get('/api/v1/companies/{id}')
 def company(id: uuid.UUID, p=Depends(principal), db: Session = Depends(get_db)):
-    return service.output(service.get_company(db, p, id))
+    return service.output_with_owner(db, p, [service.get_company(db, p, id)])[0]
 
 
 @app.patch('/api/v1/companies/{id}')
@@ -167,9 +228,13 @@ def delete_company(id: uuid.UUID, request: Request, expected_version: int, key: 
 
 
 @app.get('/api/v1/companies/{id}/contacts')
-def contacts(id: uuid.UUID, p=Depends(principal), db: Session = Depends(get_db)):
+def contacts(id: uuid.UUID, limit: int | None = None, offset: int = 0, q: str = '', p=Depends(principal), db: Session = Depends(get_db)):
     service.get_company(db, p, id)
-    return {'items': [service.output(c) for c in db.scalars(select(Contact).where(Contact.tenant_id == p.membership.tenant_id, Contact.company_id == id, Contact.deleted_at.is_(None)).order_by(Contact.created_at, Contact.id))]}
+    if offset < 0 or (limit is not None and not 1 <= limit <= 100): raise error(422, 'VALIDATION_ERROR', 'Invalid pagination')
+    query = select(Contact).where(Contact.tenant_id == p.membership.tenant_id, Contact.company_id == id, Contact.deleted_at.is_(None)).order_by(Contact.created_at, Contact.id).offset(offset)
+    if q: query = query.where(Contact.name.ilike('%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%', escape='\\'))
+    if limit is not None: query = query.limit(limit)
+    return {'items': [service.output(c) for c in db.scalars(query)]}
 
 
 @app.post('/api/v1/companies/{id}/contacts')

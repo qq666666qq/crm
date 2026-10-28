@@ -157,6 +157,7 @@ class Activity(Record, Base):
     lead_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     opportunity_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     follow_up_task_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default=text('1'))
     activity_type: Mapped[str] = mapped_column(String(30))
     direction: Mapped[str | None] = mapped_column(String(20))
     subject: Mapped[str | None] = mapped_column(String(255))

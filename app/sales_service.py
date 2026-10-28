@@ -16,10 +16,10 @@ def now(): return datetime.now(timezone.utc)
 def get(db, p, model, id, lock=False, include_deleted=False):
     q = select(model).where(model.id == id, model.tenant_id == p.membership.tenant_id)
     if hasattr(model, 'deleted_at') and not include_deleted: q = q.where(model.deleted_at.is_(None))
-    if p.membership.role == 'sales':
-        if model in (Lead, Opportunity): q = q.where(model.owner_id == p.user.id)
-        elif model is FollowUpTask: q = q.where(model.assigned_to == p.user.id)
-        elif model is Activity: q = q.where(model.created_by == p.user.id)
+    if p.membership.role != 'admin':
+        if model in (Lead, Opportunity): q = q.where(model.owner_id.in_(service.scope_ids(p)))
+        elif model is FollowUpTask: q = q.where(model.assigned_to.in_(service.scope_ids(p)))
+        elif model is Activity: q = q.where(model.created_by.in_(service.scope_ids(p)))
     if lock: q = q.with_for_update()
     obj = db.scalar(q)
     if not obj: raise error(404, 'NOT_FOUND', 'Record not found')
@@ -54,6 +54,8 @@ def validate_links(db, p, fields, lock=False):
 
 def record(db, p, request, action, obj, fields, changes=None):
     db.add(AuditLog(tenant_id=p.membership.tenant_id, actor_id=p.user.id, action=action, object_type=obj.__tablename__, object_id=obj.id, changed_fields=list(fields), changes=jsonable_encoder(changes) if changes else None, request_id=request.state.request_id, source=request.headers.get('X-Operation-Source') if request.headers.get('X-Operation-Source') in ('human', 'agent') else 'human', agent_run_id=(request.headers.get('X-Agent-Run-ID') or '')[:100] or None))
+    from app.outbox import emit
+    emit(db, obj, action, changes)
 
 
 def create(db, p, request, model, data):
@@ -206,11 +208,6 @@ def patch(db, p, request, model, id, data):
             if changes[field] is None: raise error(422, 'VALIDATION_ERROR', 'Owner cannot be null')
             changes[field] = service.owner(db, p, changes[field])
     changes = {k: clean[k] if k not in ('owner_id', 'assigned_to') else changes[k] for k in changes}
-    if model is Activity:
-        before = {k: {'old': getattr(obj, k), 'new': v} for k, v in changes.items()}
-        for k, v in changes.items(): setattr(obj, k, v)
-        db.flush(); db.refresh(obj); record(db, p, request, 'update', obj, changes.keys(), before)
-        return service.output(obj), 200
     return change(db, p, request, obj, expected, changes, 'update')
 
 
@@ -225,9 +222,6 @@ def remove(db, p, request, model, id, expected=None):
         q = select(target.id).where(target.tenant_id == p.membership.tenant_id, field == id)
         if hasattr(target, 'deleted_at'): q = q.where(target.deleted_at.is_(None))
         if db.scalar(q.limit(1)): raise error(409, 'VALIDATION_ERROR', 'Active related records prevent deletion')
-    if model is Activity:
-        obj.deleted_at = now(); db.flush(); record(db, p, request, 'delete', obj, ['deleted_at'])
-        return service.output(obj), 200
     return change(db, p, request, obj, expected, {'deleted_at': now()}, 'delete')
 
 

@@ -26,10 +26,18 @@ def test_upgrade_preserves_phase_one_data():
             conn.execute(text("INSERT INTO users(id,email,name,password_hash,status) VALUES (:id,'existing@example.com','existing','test','active')"), {'id':user})
             conn.execute(text("INSERT INTO tenant_memberships(id,tenant_id,user_id,role,status) VALUES (:id,:tenant,:user,'admin','active')"), {'id':membership,'tenant':tenant,'user':user})
             conn.execute(text("INSERT INTO companies(id,tenant_id,name,owner_id,version,updated_by) VALUES (:id,:tenant,'Existing company',:user,1,:user)"), {'id':company,'tenant':tenant,'user':user})
+        subprocess.run([sys.executable, '-m', 'alembic', 'upgrade', '0007'], env=test_env, check=True, capture_output=True)
+        activity = uuid.uuid4()
+        with scoped.begin() as conn:
+            conn.execute(text("INSERT INTO activities(id,tenant_id,company_id,activity_type,summary,occurred_at,created_by) VALUES (:id,:tenant,:company,'note','existing activity',now(),:user)"), {'id':activity,'tenant':tenant,'company':company,'user':user})
+            before = set(conn.scalars(text("SELECT table_name FROM information_schema.tables WHERE table_schema=:schema"), {'schema':schema}))
         subprocess.run([sys.executable, '-m', 'alembic', 'upgrade', 'head'], env=test_env, check=True, capture_output=True)
         with scoped.connect() as conn:
             assert conn.scalar(text('SELECT name FROM companies WHERE id=:id'), {'id':company}) == 'Existing company'
-            assert conn.scalar(text('SELECT version_num FROM alembic_version')) == '0006'
+            assert conn.scalar(text('SELECT version_num FROM alembic_version')) == '0008'
+            assert conn.scalar(text('SELECT version FROM activities WHERE id=:id'), {'id':activity}) == 1
+            assert conn.scalar(text('SELECT summary FROM activities WHERE id=:id'), {'id':activity}) == 'existing activity'
+            assert set(conn.scalars(text("SELECT table_name FROM information_schema.tables WHERE table_schema=:schema"), {'schema':schema})) == before
             assert conn.scalar(text("SELECT count(*) FROM information_schema.tables WHERE table_schema=:schema AND table_name IN ('leads','lead_evidence','opportunities','opportunity_contacts','follow_up_tasks','activities')"), {'schema':schema}) == 6
     finally:
         scoped.dispose()

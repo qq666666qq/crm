@@ -168,4 +168,4 @@ def patch_model(name, base, versioned=True):
 LeadPatch = patch_model('LeadPatch', LeadData)
 OpportunityPatch = patch_model('OpportunityPatch', OpportunityData)
 TaskPatch = patch_model('TaskPatch', TaskData)
-ActivityPatch = patch_model('ActivityPatch', ActivityData, False)
+ActivityPatch = patch_model('ActivityPatch', ActivityData)

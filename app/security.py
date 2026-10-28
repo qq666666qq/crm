@@ -13,6 +13,7 @@ from app.models import LoginSession, Membership, Tenant, User
 from app.errors import error
 
 passwords = PasswordHash.recommended()
+_dummy_hash = passwords.hash(secrets.token_urlsafe(32))
 bearer = HTTPBearer(auto_error=False)
 
 
@@ -20,12 +21,21 @@ def token_hash(token): return hashlib.sha256(token.encode()).hexdigest()
 
 
 def login(db, email, password):
-    user = db.scalar(select(User).where(User.email == email.lower()))
+    user = db.scalar(select(User).where(User.email == email.lower()).with_for_update())
+    now = datetime.now(timezone.utc)
     try:
-        valid = user is not None and passwords.verify(password, user.password_hash)
+        valid = passwords.verify(password, user.password_hash if user else _dummy_hash)
     except Exception:
         valid = False
-    if not valid or user.status != 'active': raise error(401, 'UNAUTHORIZED', 'Invalid credentials')
+    if not user or user.status != 'active' or (user.locked_until and user.locked_until > now):
+        raise error(401, 'UNAUTHORIZED', 'Invalid credentials')
+    if not valid:
+        user.failed_logins = (user.failed_logins or 0) + 1
+        if user.failed_logins >= 5:
+            user.failed_logins = 0; user.locked_until = now + timedelta(minutes=15)
+        db.commit()
+        raise error(401, 'UNAUTHORIZED', 'Invalid credentials')
+    user.failed_logins = 0; user.locked_until = None
     token = secrets.token_urlsafe(32)
     db.add(LoginSession(token_hash=token_hash(token), user_id=user.id, expires_at=datetime.now(timezone.utc) + timedelta(hours=settings.session_hours)))
     db.commit()
@@ -39,12 +49,17 @@ class Principal:
     session: LoginSession
 
 
-def principal(request: Request, credentials: HTTPAuthorizationCredentials | None = Depends(bearer), tenant: str | None = Header(default=None, alias='X-Tenant-ID'), db: Session = Depends(get_db)):
+def authenticated(credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(get_db)):
     if not credentials: raise error(401, 'UNAUTHORIZED', 'Authentication required')
     session = db.get(LoginSession, token_hash(credentials.credentials))
     if not session or session.revoked_at or session.expires_at <= datetime.now(timezone.utc): raise error(401, 'UNAUTHORIZED', 'Session invalid or expired')
     user = db.get(User, session.user_id)
     if not user or user.status != 'active': raise error(401, 'UNAUTHORIZED', 'User disabled')
+    return user, session
+
+
+def principal(request: Request, tenant: str | None = Header(default=None, alias='X-Tenant-ID'), identity=Depends(authenticated), db: Session = Depends(get_db)):
+    user, session = identity
     try:
         import uuid
         tenant_id = uuid.UUID(tenant or '')

@@ -1,0 +1,29 @@
+{
+  "name": "crm-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron electron/main.cjs\"",
+    "build": "tsc --noEmit && vite build",
+    "start": "electron electron/main.cjs --production",
+    "test": "vitest run && node --test electron/session-check.cjs"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.80.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.20",
+    "@types/react-dom": "^18.3.6",
+    "@vitejs/plugin-react": "^4.4.1",
+    "concurrently": "^9.1.2",
+    "electron": "^35.3.1",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vitest": "^3.2.1",
+    "wait-on": "^8.0.3"
+  }
+}

@@ -19,6 +19,7 @@ from app.security import passwords
 
 @pytest.fixture
 def env():
+    if not os.getenv('TEST_DATABASE_URL'): pytest.skip('TEST_DATABASE_URL is not configured')
     url = os.environ['TEST_DATABASE_URL']
     schema = 'test_' + uuid.uuid4().hex
     admin_engine = create_engine(url)
@@ -216,3 +217,11 @@ def test_same_idempotency_key_concurrent(env):
     assert [r.status_code for r in responses] == [201, 201]
     assert responses[0].json()['id'] == responses[1].json()['id']
     with sessions() as db: assert len(list(db.scalars(select(Company)))) == 1
+
+
+def test_logout_revokes_session_before_tenant_selection(env):
+    client, sessions, (tenant, _, admin, sales), auth = env
+    headers = auth('admin@example.com', tenant)
+    token_only = {'Authorization': headers['Authorization']}
+    assert client.post('/api/v1/auth/logout', headers=token_only).status_code == 200
+    assert client.get('/api/v1/auth/tenants', headers=token_only).status_code == 401
