@@ -33,3 +33,17 @@ test('对话提交后进程退出，重启会补查且只保存一次反思',asy
   app=await open();coordinator=await createTurnCoordinator(app);await coordinator.drain();assert.equal(calls,1);assert.equal((await app.repo.search('恢复后核对交期')).items.length,1);await coordinator.close();await app.harness.close(context);
  }finally{await rm(dir,{recursive:true,force:true});}
 });
+
+
+test('恢复监听可先准备，启动前不处理已完成的对话',async()=>{
+ let listener,items=[],processed=0,resumes=0;
+ const submission={id:1,conversationId:1,type:'input',status:'done',entry:1,answer:2};
+ const entries=[{id:1,kind:'pi.user',model:[{content:'问题'}]},{id:2,kind:'pi.assistant',model:[{content:'回答'}]}];
+ const storage={scanSubmissions:async()=>({items,next:null})};
+ const harness={subscribeCommits:fn=>{listener=fn;return()=>{};},conversation:async()=>({entries:async()=>({items:entries,next:null})}),resume:()=>{resumes++;}};
+ const repo={metadata:async()=>undefined,recordTurn:async()=>{processed++;return {created_at:new Date().toISOString()};},queueTask:async()=>{},finishSkipped:async()=>{}};
+ const memoryTasks={schedule:async()=>{}};
+ const coordinator=await createTurnCoordinator({harness,storage,repo,memoryTasks,knownConversations:()=>new Map([['1',1]]),autoStart:false});
+ try{items=[submission];listener({changes:[{type:'submission',value:submission}]});await new Promise(resolve=>setImmediate(resolve));await coordinator.drain();assert.equal(processed,0);assert.equal(resumes,0);coordinator.start();await coordinator.drain();assert.equal(processed,1);assert.equal(resumes,1);}
+ finally{await coordinator.close();}
+});

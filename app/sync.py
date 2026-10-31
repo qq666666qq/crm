@@ -10,8 +10,8 @@ from app.database import get_db, SessionLocal, engine
 from app.errors import error
 from app.models import Company, Contact, LoginSession, Membership, OutboxEvent, Tenant, User
 from app.security import Principal, principal, bearer, token_hash
-from app import service
-from app import sales_service
+from app import access
+from app import sales_access
 from fastapi.security import HTTPAuthorizationCredentials
 from uuid import UUID
 from app.phase2_models import Lead, Opportunity, FollowUpTask, Activity
@@ -25,9 +25,9 @@ def allowed_object(db, p, event):
     model = MODELS.get(event.entity)
     if model is None: return None
     try:
-        if model is Company: return service.get_company(db, p, event.entity_id)
-        if model is Contact: return service.get_contact(db, p, event.entity_id)
-        return sales_service.get(db, p, model, event.entity_id)
+        if model is Company: return access.get_company(db, p, event.entity_id)
+        if model is Contact: return access.get_contact(db, p, event.entity_id)
+        return sales_access.get(db, p, model, event.entity_id)
     except Exception as exc:
         if getattr(exc, 'status_code', None) in (403, 404): return None
         raise

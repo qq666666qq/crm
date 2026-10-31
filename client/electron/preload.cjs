@@ -20,7 +20,7 @@ contextBridge.exposeInMainWorld('crm', {
   approvals: (action, id, digest) => ipcRenderer.invoke('crm:approvals', action, id, digest),
   langfuse: (action, value) => ipcRenderer.invoke('crm:langfuse', action, value),
   on: (channel, handler) => {
-    if (!['sync','revoked','connection','permission','approval','evolution-progress','memory-progress','langfuse-status'].includes(channel)) throw new Error('Invalid event');
+    if (!['sync','revoked','connection','permission','approval','evolution-progress','memory-progress','langfuse-status','agent-status'].includes(channel)) throw new Error('Invalid event');
     const listener = (_event, data) => handler(data);
     ipcRenderer.on(`crm:${channel}`, listener);
     return () => ipcRenderer.removeListener(`crm:${channel}`, listener);

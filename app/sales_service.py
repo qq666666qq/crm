@@ -4,7 +4,8 @@ from sqlalchemy import select, or_, func
 from app.errors import error
 from app.models import Company, Contact
 from app.phase2_models import Lead, LeadEvidence, Opportunity, OpportunityContact, FollowUpTask, Activity
-from app import service
+from app import access, service
+from app.sales_access import get, validate_links
 from app.change_journal import record_sales_change as record
 from pydantic import ValidationError
 from app.sales_schemas import LeadData, OpportunityData, TaskData, ActivityData
@@ -13,51 +14,12 @@ from app.sales_schemas import LeadData, OpportunityData, TaskData, ActivityData
 def now(): return datetime.now(timezone.utc)
 
 
-def get(db, p, model, id, lock=False, include_deleted=False):
-    q = select(model).where(model.id == id, model.tenant_id == p.membership.tenant_id)
-    if hasattr(model, 'deleted_at') and not include_deleted: q = q.where(model.deleted_at.is_(None))
-    if p.membership.role != 'admin':
-        if model in (Lead, Opportunity): q = q.where(model.owner_id.in_(service.scope_ids(p)))
-        elif model is FollowUpTask: q = q.where(model.assigned_to.in_(service.scope_ids(p)))
-        elif model is Activity: q = q.where(model.created_by.in_(service.scope_ids(p)))
-    if lock: q = q.with_for_update()
-    obj = db.scalar(q)
-    if not obj: raise error(404, 'NOT_FOUND', 'Record not found')
-    if model is Lead:
-        if obj.company_id: service.get_company(db, p, obj.company_id, lock)
-        if obj.contact_id: service.get_contact(db, p, obj.contact_id, lock)
-    if model is Opportunity: service.get_company(db, p, obj.company_id, lock)
-    if model in (FollowUpTask, Activity): validate_links(db, p, {key: getattr(obj, key, None) for key in ('company_id','contact_id','lead_id','opportunity_id','follow_up_task_id')})
-    return obj
-
-
-def validate_links(db, p, fields, lock=False):
-    company = service.get_company(db, p, fields['company_id'], lock) if fields.get('company_id') else None
-    contact = service.get_contact(db, p, fields['contact_id'], lock) if fields.get('contact_id') else None
-    lead = get(db, p, Lead, fields['lead_id'], lock) if fields.get('lead_id') else None
-    opportunity = get(db, p, Opportunity, fields['opportunity_id'], lock) if fields.get('opportunity_id') else None
-    task = get(db, p, FollowUpTask, fields['follow_up_task_id'], lock) if fields.get('follow_up_task_id') else None
-    task_lead = get(db, p, Lead, task.lead_id, lock) if task and task.lead_id else None
-    task_opportunity = get(db, p, Opportunity, task.opportunity_id, lock) if task and task.opportunity_id else None
-    company_ids = {x for x in (getattr(company, 'id', None), getattr(contact, 'company_id', None), getattr(lead, 'company_id', None), getattr(opportunity, 'company_id', None), getattr(task, 'company_id', None), getattr(task_lead, 'company_id', None), getattr(task_opportunity, 'company_id', None)) if x}
-    if len(company_ids) > 1: raise error(409, 'VALIDATION_ERROR', 'Related objects belong to different companies')
-    if task and ((lead and task.lead_id and lead.id != task.lead_id) or (opportunity and task.opportunity_id and opportunity.id != task.opportunity_id)):
-        raise error(409, 'VALIDATION_ERROR', 'Related objects do not match the task')
-    if task_lead and opportunity and opportunity.originating_lead_id and task_lead.id != opportunity.originating_lead_id:
-        raise error(409, 'VALIDATION_ERROR', 'Opportunity does not match the task lead')
-    if lead and task_opportunity and task_opportunity.originating_lead_id and lead.id != task_opportunity.originating_lead_id:
-        raise error(409, 'VALIDATION_ERROR', 'Lead does not match the task opportunity')
-    if lead and opportunity and opportunity.originating_lead_id and lead.id != opportunity.originating_lead_id:
-        raise error(409, 'VALIDATION_ERROR', 'Lead does not match the opportunity')
-    return company, contact, lead, opportunity, task
-
-
 def create(db, p, request, model, data):
     values = data.model_dump()
     evidence = values.pop('evidence', None)
     validate_links(db, p, values, True)
-    if model in (Lead, Opportunity): values['owner_id'] = service.owner(db, p, values.get('owner_id'))
-    if model is FollowUpTask: values['assigned_to'] = service.owner(db, p, values.get('assigned_to'))
+    if model in (Lead, Opportunity): values['owner_id'] = access.owner(db, p, values.get('owner_id'))
+    if model is FollowUpTask: values['assigned_to'] = access.owner(db, p, values.get('assigned_to'))
     if model is Lead:
         if values.get('contact_id') and not values.get('company_id'): raise error(422, 'VALIDATION_ERROR', 'Contact requires its company')
     obj = model(**values, tenant_id=p.membership.tenant_id, created_by=p.user.id)
@@ -119,11 +81,11 @@ def convert(db, p, request, id, data):
         if new_company.get('owner_id') is None: new_company['owner_id'] = lead.owner_id
         created, _ = service.create(db, p, request, Company, new_company)
         from uuid import UUID
-        company = service.get_company(db, p, UUID(created['id']), True)
+        company = access.get_company(db, p, UUID(created['id']), True)
     else:
         company_id = data.company_id or lead.company_id
         if not company_id: raise error(409, 'VALIDATION_ERROR', 'Choose an existing company or provide a new company')
-        company = service.get_company(db, p, company_id, True)
+        company = access.get_company(db, p, company_id, True)
     if lead.company_id and lead.company_id != company.id: raise error(409, 'VALIDATION_ERROR', 'Company identity does not match the lead')
     if lead.contact_id and data.contact_new: raise error(409, 'VALIDATION_ERROR', 'The lead already has an identified contact')
     if lead.contact_id and data.contact_id and lead.contact_id != data.contact_id: raise error(409, 'VALIDATION_ERROR', 'Contact identity does not match the lead')
@@ -132,7 +94,7 @@ def convert(db, p, request, id, data):
         created_contact, _ = service.create(db, p, request, Contact, data.contact_new.model_dump(), company.id)
         from uuid import UUID
         contact_id = UUID(created_contact['id'])
-    if contact_id and service.get_contact(db, p, contact_id, True).company_id != company.id: raise error(409, 'VALIDATION_ERROR', 'Contact belongs to another company')
+    if contact_id and access.get_contact(db, p, contact_id, True).company_id != company.id: raise error(409, 'VALIDATION_ERROR', 'Contact belongs to another company')
     # Existing activities and tasks must remain consistent with the resolved company.
     for model in (FollowUpTask, Activity):
         for linked in db.scalars(select(model).where(model.tenant_id == lead.tenant_id, model.lead_id == lead.id, model.deleted_at.is_(None)).with_for_update()):
@@ -200,7 +162,7 @@ def patch(db, p, request, model, id, data):
     for field in ('owner_id', 'assigned_to'):
         if field in changes:
             if changes[field] is None: raise error(422, 'VALIDATION_ERROR', 'Owner cannot be null')
-            changes[field] = service.owner(db, p, changes[field])
+            changes[field] = access.owner(db, p, changes[field])
     changes = {k: clean[k] if k not in ('owner_id', 'assigned_to') else changes[k] for k in changes}
     return change(db, p, request, obj, expected, changes, 'update')
 
@@ -221,7 +183,7 @@ def remove(db, p, request, model, id, expected=None):
 
 def add_contact(db, p, request, id, data):
     opportunity = get(db, p, Opportunity, id, True)
-    contact = service.get_contact(db, p, data.contact_id, True)
+    contact = access.get_contact(db, p, data.contact_id, True)
     if opportunity.company_id != contact.company_id: raise error(409, 'VALIDATION_ERROR', 'Contact belongs to another company')
     link = OpportunityContact(tenant_id=p.membership.tenant_id, opportunity_id=id, **data.model_dump())
     db.add(link); db.flush(); db.refresh(link)

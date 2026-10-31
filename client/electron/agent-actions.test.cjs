@@ -32,3 +32,10 @@ test('预设、对话和技能选择映射到限定的工作进程请求',async(
   selected.push('later-change');
   assert.deepEqual(result,{type:'memory-skills',payload:{value:['skill-a']}});
 });
+
+
+test('对话续接只转发合法的消息和稳定请求标识',async()=>{
+ const invoke=async(type,payload)=>({type,payload}),requestId='12345678-1234-1234-1234-123456789abc';
+ assert.deepEqual(await dispatchAgentAction('chat',{text:'你好',requestId,extra:'ignored'},invoke),{type:'chat',payload:{text:'你好',requestId}});
+ await assert.rejects(dispatchAgentAction('chat',{text:'你好',requestId:'invalid'},invoke),/Invalid agent action/);
+});

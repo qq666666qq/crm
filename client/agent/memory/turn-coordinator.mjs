@@ -5,8 +5,8 @@ import {evaluateTurn} from './turn-policy.mjs';
 const later=(a,b)=>BigInt(String(a))>BigInt(String(b));
 
 // Commit listeners only enqueue IDs. All reads and writes happen after the listener returns.
-export async function createTurnCoordinator({harness,storage,repo,memoryTasks,idleWriter,knownConversations,onProgress=()=>{}}){
- let tail=Promise.resolve(),stopped=false;const queued=new Set();
+export async function createTurnCoordinator({harness,storage,repo,memoryTasks,idleWriter,knownConversations,onProgress=()=>{},autoStart=true}){
+ let tail=Promise.resolve(),stopped=false,started=false;const queued=new Set(),backlog=new Map();
  async function scanSubmissions(conversationId){
   const result=[];let cursor;
   do{const page=await storage.scanSubmissions({conversationId,status:'done',order:'ascending'},500,cursor,BACKGROUND_CONTEXT);result.push(...page.items.filter(item=>item.type==='input'));cursor=page.next;}while(cursor);
@@ -37,7 +37,7 @@ export async function createTurnCoordinator({harness,storage,repo,memoryTasks,id
   if(!currentSafe||(!decisions.writer&&!explicit)){await repo.finishSkipped(ref,'writer');onProgress({conversationId:ref.conversationId,submissionId:ref.submissionId,kind:'writer',status:'skipped'});}
  }
  function enqueue(submission){
-  const key=String(submission.id);if(stopped||queued.has(key))return;queued.add(key);
+  const key=String(submission.id);if(stopped||queued.has(key))return;if(!started){backlog.set(key,submission);return;}queued.add(key);
   const work=tail.then(()=>process(submission));tail=work.catch(()=>{onProgress({conversationId:String(submission.conversationId),submissionId:key,kind:'check',status:'failed'});}).finally(()=>queued.delete(key));
  }
  const unsubscribe=harness.subscribeCommits(publication=>{for(const change of publication.changes)if(change.type==='submission'&&change.value.type==='input'&&change.value.status==='done')queueMicrotask(()=>enqueue(change.value));});
@@ -60,6 +60,7 @@ export async function createTurnCoordinator({harness,storage,repo,memoryTasks,id
   if(!user||!answer||data.snapshot.entries.reduce((sum,item)=>sum+item.text.length,0)<100)return 'source_unavailable';
   await memoryTasks.schedule(harness,data.ref,data.snapshot,'writer');return 'completed';
  });
- harness.resume();
- return {snapshotForSubmission,async drain(){await tail;},async close(){stopped=true;unsubscribe();await tail;}};
+ function start(){if(stopped||started)return;started=true;for(const submission of backlog.values())enqueue(submission);backlog.clear();harness.resume();}
+ if(autoStart)start();
+ return {start,snapshotForSubmission,async drain(){await tail;},async close(){stopped=true;backlog.clear();unsubscribe();await tail;}};
 }

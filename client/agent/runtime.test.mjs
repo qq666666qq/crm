@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import {mkdtemp,rm,access} from 'node:fs/promises';
 import os from 'node:os';import path from 'node:path';
 import {openRuntime} from './runtime.mjs';
+import {createRunCoordinator} from './run-coordinator.mjs';
+import {openTrace} from './trace.mjs';
+import {Harness} from '@earendil-works/pi-durable';
 import {fauxProvider,fauxAssistantMessage,fauxToolCall} from '@earendil-works/pi-ai';
 test('加密 Pi 会话重启后恢复，错误密钥无法打开',async()=>{const dir=await mkdtemp(path.join(os.tmpdir(),'crm-pi-encrypted-'));const file=path.join(dir,'session.sqlite'),key='1'.repeat(64),faux=fauxProvider(),model=faux.getModel(),options={databaseKey:key,modelProvider:faux.provider,modelSelection:{provider:model.provider,modelId:model.id},modelReady:()=>true};try{faux.setResponses([fauxAssistantMessage('机密回答')]);let runtime=await openRuntime(file,options);await runtime.chat('机密问题');await runtime.close();runtime=await openRuntime(file,options);assert.ok((await runtime.history()).some(x=>x.text==='机密问题'));await runtime.close();await assert.rejects(openRuntime(file,{...options,databaseKey:'2'.repeat(64)}));}finally{try{await rm(dir,{recursive:true,force:true});}catch{}}});
 test('Pi 加密会话和记忆共享数据库并在重启后可检索',async()=>{const dir=await mkdtemp(path.join(os.tmpdir(),'crm-pi-memory-')),file=path.join(dir,'session.sqlite'),options={databaseKey:'1'.repeat(64),memoryScope:'scope-a',enableMemory:true};try{let runtime=await openRuntime(file,options);await runtime.memory.save({operationKey:'u1',kind:'project',content:'客户计划采购厨房设备',sources:[{conversationId:'c1',entryId:'e1'}]});await runtime.close();runtime=await openRuntime(file,options);assert.equal((await runtime.memory.search('采购厨房')).items.length,1);await runtime.close();}finally{try{await rm(dir,{recursive:true,force:true});}catch{}}});
@@ -79,3 +82,64 @@ test('自进化比较与人工选择保存在加密 Pi 会话中，并按对话�
 test('多个临时会话互相隔离',async()=>{const faux=fauxProvider(),model=faux.getModel();const runtime=await openRuntime(':memory:',{modelProvider:faux.provider,modelSelection:{provider:model.provider,modelId:model.id},modelReady:()=>true});try{const first=String(runtime.conversationId);faux.setResponses([fauxAssistantMessage('答案')]);await runtime.chat('第一个会话');await runtime.newConversation();assert.deepEqual(await runtime.history(),[]);await runtime.selectConversation(first);assert.ok((await runtime.history()).some(x=>x.text==='第一个会话'));}finally{await runtime.close();}});
 
 test('多个会话使用 Pi SQLite 保存并在重启后恢复',async()=>{const dir=await mkdtemp(path.join(os.tmpdir(),'crm-pi-persist-')),file=path.join(dir,'conversation.sqlite'),faux=fauxProvider(),model=faux.getModel(),options={modelProvider:faux.provider,modelSelection:{provider:model.provider,modelId:model.id},modelReady:()=>true};try{let runtime=await openRuntime(file,options);faux.setResponses([fauxAssistantMessage('第一条回答'),fauxAssistantMessage('第二条回答')]);await runtime.chat('第一个问题');const first=String(runtime.conversationId);await runtime.newConversation();await runtime.chat('第二个问题');const second=String(runtime.conversationId);await runtime.close();runtime=await openRuntime(file,options);const list=await runtime.listConversations();assert.ok(list.some(x=>x.id===first&&x.title==='第一个问题'));assert.ok(list.some(x=>x.id===second&&x.title==='第二个问题'));await runtime.selectConversation(second);assert.ok((await runtime.history()).some(x=>x.text==='第二条回答'));await runtime.selectConversation(first);assert.ok((await runtime.history()).some(x=>x.text==='第一条回答'));await runtime.close();}finally{await rm(dir,{recursive:true,force:true});}});
+
+
+test('标题保存异常后释放对话忙碌状态',async()=>{
+ const open=Harness.open;let failNext=false,runtime;
+ Harness.open=async(...args)=>{const harness=await open(...args),commit=harness.commit.bind(harness);harness.commit=(...values)=>{if(failNext){failNext=false;throw Error('TITLE_SAVE_FAILED');}return commit(...values);};return harness;};
+ try{runtime=await openRuntime(':memory:',{modelReady:()=>true});failNext=true;await assert.rejects(runtime.chat('测试标题'),/TITLE_SAVE_FAILED/);const next=await runtime.newConversation();assert.ok(next.id);}
+ finally{Harness.open=open;if(runtime)await runtime.close();}
+});
+
+
+test('对话实际运行期间拒绝另一个对话和切换',async()=>{
+ const faux=fauxProvider(),model=faux.getModel();let started,release;
+ const entered=new Promise(resolve=>{started=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+ faux.setResponses([async()=>{started();await gate;return fauxAssistantMessage('完成');}]);
+ const runtime=await openRuntime(':memory:',{modelProvider:faux.provider,modelSelection:{provider:model.provider,modelId:model.id},modelReady:()=>true});
+ try{const first=runtime.chat('第一条');await entered;await assert.rejects(runtime.chat('第二条'),/会话正在处理/);await assert.rejects(runtime.newConversation(),/BUSY/);release();assert.equal((await first).answer,'完成');}
+ finally{release();await runtime.close();}
+});
+
+
+test('Pi 存储故障报告并通知运行时关闭，通知不包含错误原文',async()=>{
+ const open=Harness.open;let fail=false,runtime;const reports=[];let notify,timer;const closed=new Promise(resolve=>{notify=resolve;});
+ Harness.open=async(storage,...args)=>{const commit=storage.commit.bind(storage);storage.commit=(...values)=>{if(fail)throw Error('PRIVATE_STORAGE_DETAIL');return commit(...values);};return open(storage,...args);};
+ try{runtime=await openRuntime(':memory:',{onRuntimeReport:event=>reports.push(event),onRuntimeClosed:notify});fail=true;await assert.rejects(runtime.newConversation());const reason=await Promise.race([closed,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('CLOSE_TIMEOUT')),5000);})]);assert.equal(reason.reason,'STORAGE_FAILED');assert.ok(reports.some(event=>event.type==='session_failed'));assert.doesNotMatch(JSON.stringify(reports),/PRIVATE_STORAGE_DETAIL/);}
+ finally{clearTimeout(timer);Harness.open=open;if(runtime)await runtime.close();}
+});
+
+
+test('运行时初始化失败后关闭已经打开的 Pi 存储',async()=>{
+ const open=Harness.open;let captured;
+ Harness.open=async(...args)=>{captured=await open(...args);captured.commit=()=>{throw Error('INITIALIZATION_FAILED');};return captured;};
+ try{await assert.rejects(openRuntime(':memory:'),/INITIALIZATION_FAILED/);assert.equal((await captured.closed).reason,'closed');}
+ finally{Harness.open=open;}
+});
+
+
+test('同一请求跨重启续接 Pi 提交，并拒绝不同内容或对话',async()=>{
+ const dir=await mkdtemp(path.join(os.tmpdir(),'crm-chat-request-')),file=path.join(dir,'session.sqlite'),faux=fauxProvider(),model=faux.getModel(),id='12345678-1234-1234-1234-123456789abc';let calls=0,runtime;
+ const options={modelProvider:faux.provider,modelSelection:{provider:model.provider,modelId:model.id},modelReady:()=>true};
+ try{faux.setResponses([()=>{calls++;return fauxAssistantMessage('同一个回答');}]);runtime=await openRuntime(file,options);const first=await runtime.chat('同一个问题',undefined,id);await runtime.close();runtime=await openRuntime(file,options);const again=await runtime.chat('同一个问题',undefined,id);assert.equal(again.answer,first.answer);assert.equal(again.traceId,first.traceId);assert.equal(calls,1);assert.equal((await runtime.history()).filter(item=>item.text==='同一个问题').length,1);await assert.rejects(runtime.chat('不同问题',undefined,id),/CHAT_REQUEST_CONFLICT/);await runtime.newConversation();await assert.rejects(runtime.chat('同一个问题',undefined,id),/CHAT_REQUEST_CONFLICT/);}
+ finally{if(runtime)await runtime.close();await rm(dir,{recursive:true,force:true});}
+});
+
+
+test('语义索引启用时先挂记忆监听再恢复 Pi 调度',async()=>{
+ const dir=await mkdtemp(path.join(os.tmpdir(),'crm-memory-order-')),file=path.join(dir,'session.sqlite'),open=Harness.open;let runtime,events=[];
+ const options={enableMemory:true,memoryScope:'test',modelReady:()=>false,embeddingProvider:async texts=>texts.map(()=>[1,0])};
+ try{runtime=await openRuntime(file,options);await runtime.memorySemantic(true);await runtime.close();runtime=null;
+  Harness.open=async(...args)=>{const harness=await open(...args),subscribe=harness.subscribeCommits.bind(harness),resume=harness.resume.bind(harness);let listening=false;harness.subscribeCommits=fn=>{listening=true;return subscribe(fn);};harness.resume=()=>{events.push(listening);return resume();};return harness;};
+  runtime=await openRuntime(file,options);assert.ok(events.length>0);assert.ok(events.every(Boolean));
+ }finally{Harness.open=open;if(runtime)await runtime.close();await rm(dir,{recursive:true,force:true});}
+});
+
+test('重连已完成的 Pi 对话不新建第二条完整轨迹',async()=>{
+ const dir=await mkdtemp(path.join(os.tmpdir(),'crm-chat-trace-retry-')),file=path.join(dir,'session.sqlite'),faux=fauxProvider(),model=faux.getModel(),id='12345678-1234-1234-1234-123456789abc';let runtime,runs;
+ const options={modelProvider:faux.provider,modelSelection:{provider:model.provider,modelId:model.id},modelReady:()=>true,onRunTelemetry:record=>runs?.telemetry(record)};
+ async function start(){runtime=await openRuntime(file,options);const trace=await openTrace(dir);runs=createRunCoordinator({getRuntime:()=>runtime,getTrace:()=>trace,ready:Promise.resolve(),send:()=>{}});return trace;}
+ try{faux.setResponses([fauxAssistantMessage('一次回答')]);let trace=await start();const first=await runs.chat('只提交一次',id);assert.equal((await trace.list()).length,1);await runs.close();runtime=null;runs=null;
+  trace=await start();const second=await runs.chat('只提交一次',id);assert.equal(second.traceId,first.traceId);assert.equal((await trace.list()).length,1);assert.equal((await runtime.tracePage({target:'a'.repeat(64)})).items.length,1);
+ }finally{if(runs)await runs.close();else if(runtime)await runtime.close();await rm(dir,{recursive:true,force:true});}
+});

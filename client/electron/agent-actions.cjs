@@ -27,6 +27,7 @@ async function dispatchAgentAction(action,value,agentRequest) {
     if (action==='memory-rollback' && value && typeof value==='object' && typeof value.id==='string' && /^[0-9a-f-]{36}$/i.test(value.id) && Number.isSafeInteger(value.expectedVersion) && value.expectedVersion>0) return agentRequest('memory-rollback',{value:{id:value.id,expectedVersion:value.expectedVersion}});
     if (action==='demo-lead') return agentRequest('demo-lead');
     if (action==='configure-model' && typeof value==='string' && value.length>=10 && value.length<=512) return agentRequest('configure-model',{key:value});
+    if (action==='chat' && value && typeof value==='object' && typeof value.text==='string' && value.text.trim() && value.text.length<=8000 && typeof value.requestId==='string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.requestId)) return agentRequest('chat',{text:value.text,requestId:value.requestId});
     if (action==='chat' && typeof value==='string' && value.trim() && value.length<=8000) return agentRequest('chat',{text:value});
     if (action==='select-preset' && ['lead-opportunity','rag','creator'].includes(value)) return agentRequest('select-preset',{preset:value});
     if (action==='demo-search' && typeof value==='string' && value.length<=500) return agentRequest('demo-search',{query:value});

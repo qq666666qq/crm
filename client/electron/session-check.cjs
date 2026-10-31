@@ -221,3 +221,12 @@ test('authentication actions use the approved endpoints and clear a changed sess
   assert.equal(h.streams[0].signal.aborted,true);
   await assert.rejects(()=>h.call('request','/api/v1/companies','GET'),/Authentication required/);
 });
+
+
+test('主进程收到存储故障后等待旧进程退出，并向页面报告恢复',async()=>{
+ const h=await harness();await h.call('login','person@example.com','password');await h.call('select-tenant','A');await h.call('agent','presets');
+ const old=h.workers[0];old.emit('message',{type:'ready'});const post=old.postMessage;old.postMessage=message=>{if(message.type==='close'){old.sent.push(message);return;}post(message);};
+ old.emit('message',{type:'runtime-failed'});const pending=h.call('agent','presets');await tick();assert.equal(h.workers.length,1);assert.ok(old.sent.some(message=>message.type==='close'));
+ old.emit('exit',0);await pending;assert.equal(h.workers.length,2);h.workers[1].emit('message',{type:'ready'});
+ assert.ok(h.notices.some(([name,value])=>name==='crm:agent-status'&&value.state==='recovering'));assert.ok(h.notices.some(([name,value])=>name==='crm:agent-status'&&value.state==='ready'&&value.recovered));await h.call('logout');
+});

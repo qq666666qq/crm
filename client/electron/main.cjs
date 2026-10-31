@@ -12,18 +12,18 @@ const {inspectLegacy} = require('./legacy-session.cjs');
 const fs = require('node:fs/promises');
 const {readPath} = require('./agent-crm.cjs');
 const {approvalStore} = require('./agent-approvals.cjs');
+const {createApprovalExecutor} = require('./approval-executor.cjs');
 const {agentDatabaseKey} = require('./agent-key.cjs');
 const {dispatchAgentAction} = require('./agent-actions.cjs');
+const {createAgentHost} = require('./agent-host.cjs');
 const {createSyncStream} = require('./sync-stream.cjs');
 const {createCrmTransport} = require('./crm-transport.cjs');
 const path = require('node:path');
-const {createHash, randomUUID} = require('node:crypto');
+const {createHash} = require('node:crypto');
 
 const api = new URL(process.env.CRM_API_URL || 'http://127.0.0.1:8000');
 if (!['https:', 'http:'].includes(api.protocol) || api.username || api.password || (api.protocol !== 'https:' && !['localhost', '127.0.0.1', '::1', '[::1]'].includes(api.hostname))) throw new Error('CRM_API_URL must use HTTPS, except for loopback development');
-let windowRef, token = null, tenant = null, userId = null, generation = 0, agent = null, agentPrivate = false;
-let agentStopping = Promise.resolve();
-const approvalsInFlight = new Set();
+let windowRef, token = null, tenant = null, userId = null, generation = 0, agentPrivate = false;
 const mockBackground=backgroundRunner({run:(target,key)=>mockSyncStore().run(target,key)});
 const runDetails = createLangfuseQueue(detail=>{const cfg=langfuseSettings();return uploadLangfuse(buildLangfusePayload(detail,langfuseBuildOpts(cfg)),cfg);});
 let langfuseConfig = null, traceStorageError = null;
@@ -36,11 +36,7 @@ const traceArchive=createTraceArchive({
 
 function send(channel, data) { if (windowRef && !windowRef.isDestroyed()) windowRef.webContents.send(channel, data); }
 function clearRequests() { generation++; transport.reset(); syncStream.stop(); }
-function stopAgent() {
-  const child=agent;if(!child)return agentStopping;agent=null;
-  const stopped=new Promise(resolve=>{let done=false;const finish=()=>{if(done)return;done=true;clearTimeout(timer);resolve();};const timer=setTimeout(()=>{try{child.kill();}catch{}},10000);child.once('exit',finish);try{child.postMessage({type:'close'});}catch{try{child.kill();}catch{}}});
-  agentStopping=Promise.all([agentStopping,stopped]).then(()=>{});return agentStopping;
-}
+function stopAgent() { return agentHost.stop(); }
 function cache() { return sessionCache(safeStorage, app.getPath('userData'), api.origin); }
 function modules() { if(!token||!tenant||!userId)throw new Error('Authentication required');const scope=createHash('sha256').update(`${api.origin}:${tenant}:${userId}`).digest('hex');return moduleStore(path.join(app.getPath('userData'),'modules',scope)); }
 function moduleData(){if(!token||!tenant||!userId)throw Error('Authentication required');const scope=createHash('sha256').update(`${api.origin}:${tenant}:${userId}`).digest('hex');return moduleRecords(path.join(app.getPath('userData'),'module-records',scope),safeStorage,scope,modules());}
@@ -53,54 +49,41 @@ function langfuseBuildOpts(cfg){return {userId:tenant&&userId?createHash('sha256
 async function storeRunDetail(detail){if(!detail||typeof detail.id!=='string'||!detail.id)return;runDetails.add(detail);send('crm:langfuse-status',{pending:runDetails.pending()});const cfg=langfuseSettings();if(!cfg.autoUpload||!langfuseConfigured())return;const current=generation,result=await runDetails.upload(detail.id);if(current===generation)send('crm:langfuse-status',{ok:result.ok,error:result.error||null,pending:runDetails.pending()});}
 async function handleSavedTrace(id){const current=generation,cfg=langfuseSettings();if(cfg.autoUpload&&langfuseConfigured()){const result=await traceArchive.uploadOne(id);if(current===generation)send('crm:langfuse-status',{ok:result.ok,error:result.error||null});}else if(current===generation)send('crm:langfuse-status',{});}
 async function langfuseStatus(){const cfg=langfuseSettings(),saved=await traceArchive.status();return {configured:langfuseConfigured(),baseUrl:cfg.baseUrl||'',autoUpload:cfg.autoUpload,pending:saved.pending+runDetails.pending(),lastError:traceStorageError||saved.lastError||runDetails.lastError()};}
-function clearSession(forget = false) { mockBackground.stop(); stopAgent(); agentPrivate=false; clearRequests(); runDetails.clear(); langfuseConfig=null; traceStorageError=null; token = null; tenant = null; userId = null; if (forget) { try { cache().clear(); } catch {} } }
-async function startAgent() {
-  if (!token || !tenant || !userId) throw new Error('Authentication required');
-  const requestedGeneration=generation;let stopTimeout;
-  try{await Promise.race([agentStopping,new Promise((_,reject)=>{stopTimeout=setTimeout(()=>reject(new Error('AGENT_STOP_TIMEOUT')),15000);})]);}finally{clearTimeout(stopTimeout);}
-  if(requestedGeneration!==generation||!token||!tenant||!userId)throw new Error('Session changed');
-  if (agent) return agent;
-  const scope = createHash('sha256').update(`${api.origin}:${tenant}:${userId}`).digest('hex');
-  const data = path.join(app.getPath('userData'), 'agent', scope);
+function resetWorkspace() { mockBackground.stop(); stopAgent(); agentPrivate=false; clearRequests(); runDetails.clear(); langfuseConfig=null; traceStorageError=null; userId=null; }
+function clearSession(forget = false) { resetWorkspace(); token = null; tenant = null; if (forget) { try { cache().clear(); } catch {} } }
+function launchAgent() {
+  if(!token||!tenant||!userId)throw Error('Authentication required');
+  const scope=createHash('sha256').update(`${api.origin}:${tenant}:${userId}`).digest('hex');
+  const data=path.join(app.getPath('userData'),'agent',scope);
   const databaseKey=agentPrivate?null:agentDatabaseKey(safeStorage,data,scope);
-  const child = utilityProcess.fork(path.join(__dirname, '../agent/worker.mjs'), [], {env:{CRM_AGENT_DATA_DIR:data, CRM_AGENT_PRIVATE:agentPrivate?'1':'0', SystemRoot:process.env.SystemRoot || ''}, stdio:'pipe'});
-  agent = child;
-  child.on('message', async message => {
-    if(!['crm-read','crm-propose'].includes(message?.type)||typeof message.id!=='string'||message.id.length>80)return;
-    const originalGeneration=generation;
+  const child=utilityProcess.fork(path.join(__dirname,'../agent/worker.mjs'),[],{env:{CRM_AGENT_DATA_DIR:data,CRM_AGENT_PRIVATE:agentPrivate?'1':'0',SystemRoot:process.env.SystemRoot||''},stdio:'pipe'});
+  return {child,initialize:()=>{if(databaseKey)child.postMessage({type:'initialize',key:databaseKey});}};
+}
+async function handleAgentMessage(child,message,originalGeneration) {
+  if(!agentHost.isCurrent(child,originalGeneration))return;
+  if(['crm-read','crm-propose'].includes(message?.type)&&typeof message.id==='string'&&message.id.length<=80){
     try {
-      if(agent!==child||!token||!tenant||!userId)throw Error('Session unavailable');
       if(message.type==='crm-propose'){
         const type={'propose-company':'create_company','propose-contact':'create_contact','propose-opportunity':'create_opportunity','propose-task':'create_task','propose-activity':'create_activity','propose-company-update':'update_company','propose-contact-update':'update_contact','propose-task-complete':'complete_task','propose-lead':'create_lead','propose-conversion':'convert_lead','propose-lead-update':'update_lead','propose-opportunity-update':'update_opportunity'}[message.operation]||null;
         const item=approvals().create(type,message.args,message.callId,message.runId||undefined);send('crm:approval',{});
         child.postMessage({type:'crm-read-result',id:message.id,data:{id:item.id,status:item.status,message:item.status==='pending'?'已提交用户审核，尚未执行':'该工具调用已有记录，请查看实际状态'}});return;
       }
       const result=await call(readPath(message.operation,message.args));
-      if(agent!==child||generation!==originalGeneration)return;
+      if(!agentHost.isCurrent(child,originalGeneration))return;
       if(!result.ok||JSON.stringify(result.data).length>100000)throw Error('CRM request failed');
       child.postMessage({type:'crm-read-result',id:message.id,data:result.data});
-    } catch { if(agent===child&&generation===originalGeneration)child.postMessage({type:'crm-read-result',id:message.id,error:'CRM_READ_FAILED'}); }
-  });
-  child.on('exit', () => { if (agent === child) agent = null; });
-  child.on('message', message => { if (agent===child && message && message.type === 'run-detail') void storeRunDetail(message.detail); });
-  child.on('message', message => { if(agent===child&&typeof message?.id==='string'&&message.type==='run-detail-ready')void handleSavedTrace(message.id).catch(()=>{}); });
-  child.on('message', message => { if(agent===child&&message?.type==='trace-storage-error'){traceStorageError='TRACE_STORAGE_FAILED';send('crm:langfuse-status',{error:traceStorageError});} });
-  child.on('message', message => { if (agent===child && token && tenant && userId && message?.type==='memory-progress') send('crm:memory-progress',message.event); });
-  child.on('message', message => { if (agent===child && token && tenant && userId && message?.type==='evolution-progress' && message.event) send('crm:evolution-progress',message.event); });
-  if(databaseKey)child.postMessage({type:'initialize',key:databaseKey});
-  return child;
+    } catch {if(agentHost.isCurrent(child,originalGeneration))child.postMessage({type:'crm-read-result',id:message.id,error:'CRM_READ_FAILED'});}
+    return;
+  }
+  if(message?.type==='run-detail')void storeRunDetail(message.detail);
+  else if(message?.type==='run-detail-ready'&&typeof message.id==='string')void handleSavedTrace(message.id).catch(()=>{});
+  else if(message?.type==='trace-storage-error'){traceStorageError='TRACE_STORAGE_FAILED';send('crm:langfuse-status',{error:traceStorageError});}
+  else if(message?.type==='memory-progress')send('crm:memory-progress',message.event);
+  else if(message?.type==='evolution-progress'&&message.event)send('crm:evolution-progress',message.event);
+  else if(message?.type==='evolution-progress'&&typeof message.stage==='string')send('crm:evolution-progress',{stage:message.stage});
+  else if(message?.type==='runtime-report'&&['task_faulted','task_parked'].includes(message.event?.type))send('crm:agent-status',{state:'task',reason:message.event.type});
 }
-async function agentRequest(type, payload={}) {
-  const requestGeneration=generation,child = await startAgent(), id = randomUUID();
-  if(requestGeneration!==generation||agent!==child)throw Error('Session changed');
-  return new Promise((resolve,reject) => {
-    const timer=setTimeout(()=>finish(new Error('Agent 暂时不可用')),type==='harness2-run'?600000:['chat','evolve'].includes(type)?120000:15000);
-    function finish(error, data) { clearTimeout(timer); child.off('message',onMessage); child.off('exit',onExit); error ? reject(error) : resolve(data); }
-    function onExit() { finish(new Error('Agent 已停止')); }
-    function onMessage(message) { if(message?.type==='startup-error'){finish(new Error('会话存储无法打开，请检查本机加密设置'));return;} if(message?.id===id && (agent!==child||generation!==requestGeneration)){finish(new Error('Session changed'));return;} if(message?.id===id && message.type==='evolution-progress'){if(agent===child)send('crm:evolution-progress',{stage:message.stage});return;} if(message?.id===id) finish(message.error ? new Error('Agent 请求失败') : null,message.data); }
-    child.on('message',onMessage); child.on('exit',onExit); child.postMessage({type,id,...payload});
-  });
-}
+function agentRequest(type,payload={}) { return agentHost.request(type,payload); }
 function trusted(event) { if (!windowRef || event.sender !== windowRef.webContents) throw new Error('Unauthorized IPC sender'); }
 const transport = createCrmTransport({
   api,
@@ -116,6 +99,10 @@ const syncStream = createSyncStream({
   onSync: data => send('crm:sync', data),
   onRevoked: () => { clearSession(true); send('crm:revoked', {}); },
 });
+
+const agentHost=createAgentHost({session:()=>({authenticated:Boolean(token&&tenant&&userId),generation,privateMode:agentPrivate}),launch:launchAgent,onMessage:handleAgentMessage,onStatus:status=>send('crm:agent-status',status),setTimer:setTimeout,clearTimer:clearTimeout});
+
+const executeApproval = createApprovalExecutor({getStore:approvals,session:()=>({token,tenant,generation}),request:call});
 
 Menu.setApplicationMenu(null);
 const primaryInstance=app.requestSingleInstanceLock();
@@ -150,7 +137,7 @@ if(primaryInstance)app.whenReady().then(() => {
   ipcMain.handle('crm:tenants', async event => { trusted(event); if (!token) throw new Error('Authentication required'); return call('/api/v1/auth/tenants', 'GET', undefined, token, null); });
   ipcMain.handle('crm:select-tenant', async (event, id) => {
     trusted(event); if (!token || typeof id !== 'string') throw new Error('Authentication required');
-    mockBackground.stop(); stopAgent(); agentPrivate=false; userId = null; clearRequests(); runDetails.clear(); langfuseConfig=null; traceStorageError=null; tenant = id;
+    resetWorkspace(); tenant = id;
     const me = await call('/api/v1/auth/me');
     if (me.ok) { userId = me.data.user_id; cache().save(token, tenant); syncStream.start({token,tenant}); resumeMockBackground(); } else tenant = null;
     return me;
@@ -215,14 +202,8 @@ if(primaryInstance)app.whenReady().then(() => {
     throw new Error('Invalid langfuse action');
   });
   ipcMain.handle('crm:approvals', async (event,action,id,digest) => {
-    trusted(event);const store=approvals();if(action==='list')return store.list();
-    if(typeof id!=='string'||!/^[0-9a-f-]{36}$/i.test(id))throw Error('审批标识无效');
-    if(action==='reject')return store.transition(id,['pending'],'rejected');
-    if(action!=='confirm'||typeof digest!=='string'||!/^[0-9a-f]{64}$/.test(digest))throw Error('无效操作');
-    if(approvalsInFlight.has(id))throw Error('审批正在执行');approvalsInFlight.add(id);
-    let item;try{item=store.transition(id,['pending','retry','submitting'],'submitting',{},digest);}catch(e){approvalsInFlight.delete(id);throw e;}const gen=generation;
-    try {const result=await call(item.request.path,item.request.method,item.request.body,token,tenant,{id:item.id,runId:item.runId});if(gen!==generation)throw Error('会话变化');if(result.ok)return store.transition(id,['submitting'],'succeeded',{result:result.data});if(result.status>=500)return store.transition(id,['submitting'],'retry',{message:'结果不确定，可安全重试'});return store.transition(id,['submitting'],'failed',{message:result.error?.message||'请求失败'});}
-    catch {if(gen===generation)return store.transition(id,['submitting'],'retry',{message:'结果不确定，可安全重试'});throw Error('会话已变化');}finally{approvalsInFlight.delete(id);}
+    trusted(event);
+    return executeApproval(action,id,digest);
   });
   ipcMain.handle('crm:ego-install-guide', async event => {
     trusted(event);
@@ -238,4 +219,4 @@ if(primaryInstance)app.whenReady().then(() => {
     return dispatchAgentAction(action,value,agentRequest);
   });
 });
-app.on('window-all-closed', () => { clearSession(); void agentStopping.finally(()=>app.quit()); });
+app.on('window-all-closed', () => { clearSession(); void agentHost.stopped().finally(()=>app.quit()); });

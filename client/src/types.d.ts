@@ -21,7 +21,7 @@ declare global {
       exportTraces(): Promise<{saved:boolean}>;
       approvals(action: 'list'|'confirm'|'reject', id?: string, digest?: string): Promise<any>;
       langfuse(action: 'config'|'status'|'upload', value?: {baseUrl?:string;publicKey?:string;secretKey?:string;autoUpload?:boolean}): Promise<{configured?:boolean;baseUrl?:string;autoUpload?:boolean;pending?:number;uploaded?:number;failed?:number;total?:number;lastError?:string|null}>;
-      on(channel: 'sync' | 'revoked' | 'connection' | 'permission' | 'approval' | 'evolution-progress' | 'memory-progress' | 'langfuse-status', handler: (data: any) => void): () => void;
+      on(channel: 'sync' | 'revoked' | 'connection' | 'permission' | 'approval' | 'evolution-progress' | 'memory-progress' | 'langfuse-status' | 'agent-status', handler: (data: any) => void): () => void;
     };
   }
   type Result = { ok: true; data: any } | { ok: false; status: number; error: { code: string; message: string } };

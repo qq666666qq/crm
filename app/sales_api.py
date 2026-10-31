@@ -8,8 +8,9 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Contact
 from app.security import principal
-from app import service
+from app import access, service
 from app import sales_service as domain
+from app import sales_access
 from app.phase2_models import Lead, LeadEvidence, Opportunity, OpportunityContact, FollowUpTask, Activity
 from app.sales_schemas import LeadCreate, LeadPatch, EvidenceIn, OpportunityData, OpportunityPatch, TaskData, TaskPatch, ActivityData, ActivityPatch, Version, Reason, Note, Stage, Convert, ContactLink
 
@@ -18,9 +19,9 @@ router = APIRouter(prefix='/api/v1', tags=['sales'])
 
 def write(db, p, request, key, operation, model):
     def replay(result):
-        if model is LeadEvidence: domain.get(db, p, Lead, UUID(result['lead_id']))
-        elif model is OpportunityContact: domain.get(db, p, Opportunity, UUID(result['opportunity_id']))
-        else: domain.get(db, p, model, UUID(result['id']), include_deleted=True)
+        if model is LeadEvidence: sales_access.get(db, p, Lead, UUID(result['lead_id']))
+        elif model is OpportunityContact: sales_access.get(db, p, Opportunity, UUID(result['opportunity_id']))
+        else: sales_access.get(db, p, model, UUID(result['id']), include_deleted=True)
     body, status = service.write(db, p, request, key, operation, replay_authorize=replay)
     return JSONResponse(status_code=status, content=body)
 
@@ -31,7 +32,7 @@ def list_records(db, p, model, limit, offset, status=None, filters=None, search=
     q = select(model).where(model.tenant_id == p.membership.tenant_id, model.deleted_at.is_(None))
     if p.membership.role != 'admin':
         field = model.assigned_to if model is FollowUpTask else model.created_by if model is Activity else model.owner_id
-        q = q.where(field.in_(service.scope_ids(p)))
+        q = q.where(field.in_(access.scope_ids(p)))
     if status:
         field = model.stage if model is Opportunity else getattr(model, 'status', None)
         if field is None: raise error(422, 'VALIDATION_ERROR', 'Unsupported filter')
@@ -55,7 +56,7 @@ def list_records(db, p, model, limit, offset, status=None, filters=None, search=
         batch = list(db.scalars(q.order_by(*ordering).limit(100).offset(scan_offset)))
         if not batch: break
         for obj in batch:
-            try: domain.get(db, p, model, obj.id)
+            try: sales_access.get(db, p, model, obj.id)
             except Exception as exc:
                 if getattr(exc, 'status_code', None) == 404: continue
                 raise
@@ -74,7 +75,7 @@ def task_page(db, p, query, limit, offset):
         batch = list(db.scalars(query.limit(100).offset(scan)))
         if not batch: break
         for task in batch:
-            try: domain.get(db, p, FollowUpTask, task.id)
+            try: sales_access.get(db, p, FollowUpTask, task.id)
             except Exception as exc:
                 if getattr(exc, 'status_code', None) == 404: continue
                 raise
@@ -92,7 +93,7 @@ def leads(limit: int = 50, offset: int = 0, status: str | None = None, company_i
 def create_lead(data: LeadCreate, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)): return write(db,p,request,key,lambda: domain.create(db,p,request,Lead,data),Lead)
 
 @router.get('/leads/{id}')
-def get_lead(id: UUID, p=Depends(principal), db: Session = Depends(get_db)): return service.output_with_owner(db,p,[domain.get(db,p,Lead,id)])[0]
+def get_lead(id: UUID, p=Depends(principal), db: Session = Depends(get_db)): return service.output_with_owner(db,p,[sales_access.get(db,p,Lead,id)])[0]
 
 @router.patch('/leads/{id}')
 def patch_lead(id: UUID, data: LeadPatch, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)): return write(db,p,request,key,lambda: domain.patch(db,p,request,Lead,id,data),Lead)
@@ -117,7 +118,7 @@ def convert(id: UUID, data: Convert, request: Request, key: str | None = Header(
 
 @router.get('/leads/{id}/evidence')
 def evidence(id: UUID, limit: int = 50, offset: int = 0, p=Depends(principal), db: Session = Depends(get_db)):
-    domain.get(db,p,Lead,id)
+    sales_access.get(db,p,Lead,id)
     from app.errors import error
     if not 1 <= limit <= 100 or offset < 0: raise error(422,'VALIDATION_ERROR','Invalid pagination')
     return {'items':[service.output(x) for x in db.scalars(select(LeadEvidence).where(LeadEvidence.tenant_id==p.membership.tenant_id,LeadEvidence.lead_id==id).order_by(LeadEvidence.created_at,LeadEvidence.id).limit(limit).offset(offset))]}
@@ -132,7 +133,7 @@ def opportunities(limit: int = 50, offset: int = 0, stage: str | None = None, co
 def create_opportunity(data: OpportunityData, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)): return write(db,p,request,key,lambda: domain.create(db,p,request,Opportunity,data),Opportunity)
 
 @router.get('/opportunities/{id}')
-def get_opportunity(id: UUID, p=Depends(principal), db: Session = Depends(get_db)): return service.output_with_owner(db,p,[domain.get(db,p,Opportunity,id)])[0]
+def get_opportunity(id: UUID, p=Depends(principal), db: Session = Depends(get_db)): return service.output_with_owner(db,p,[sales_access.get(db,p,Opportunity,id)])[0]
 
 @router.patch('/opportunities/{id}')
 def patch_opportunity(id: UUID, data: OpportunityPatch, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)): return write(db,p,request,key,lambda: domain.patch(db,p,request,Opportunity,id,data),Opportunity)
@@ -151,7 +152,7 @@ def close_lost(id: UUID, data: Reason, request: Request, key: str | None = Heade
 
 @router.get('/opportunities/{id}/contacts')
 def opportunity_contacts(id: UUID, limit: int = 50, offset: int = 0, p=Depends(principal), db: Session = Depends(get_db)):
-    domain.get(db,p,Opportunity,id)
+    sales_access.get(db,p,Opportunity,id)
     from app.errors import error
     if not 1 <= limit <= 100 or offset < 0: raise error(422,'VALIDATION_ERROR','Invalid pagination')
     links = list(db.scalars(select(OpportunityContact).where(OpportunityContact.tenant_id==p.membership.tenant_id,OpportunityContact.opportunity_id==id).order_by(OpportunityContact.created_at,OpportunityContact.id).limit(limit).offset(offset)))
@@ -193,7 +194,7 @@ def tasks(limit: int = 50, offset: int = 0, status: str | None = None, company_i
 def create_task(data: TaskData, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)): return write(db,p,request,key,lambda: domain.create(db,p,request,FollowUpTask,data),FollowUpTask)
 
 @router.get('/follow-up-tasks/{id}')
-def get_task(id: UUID, p=Depends(principal), db: Session = Depends(get_db)): return service.output_with_owner(db,p,[domain.get(db,p,FollowUpTask,id)])[0]
+def get_task(id: UUID, p=Depends(principal), db: Session = Depends(get_db)): return service.output_with_owner(db,p,[sales_access.get(db,p,FollowUpTask,id)])[0]
 
 @router.patch('/follow-up-tasks/{id}')
 def patch_task(id: UUID, data: TaskPatch, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)): return write(db,p,request,key,lambda: domain.patch(db,p,request,FollowUpTask,id,data),FollowUpTask)
@@ -214,7 +215,7 @@ def activities(limit: int = 50, offset: int = 0, company_id: UUID | None = None,
 def create_activity(data: ActivityData, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)): return write(db,p,request,key,lambda: domain.create(db,p,request,Activity,data),Activity)
 
 @router.get('/activities/{id}')
-def get_activity(id: UUID, p=Depends(principal), db: Session = Depends(get_db)): return service.output(domain.get(db,p,Activity,id))
+def get_activity(id: UUID, p=Depends(principal), db: Session = Depends(get_db)): return service.output(sales_access.get(db,p,Activity,id))
 
 @router.patch('/activities/{id}')
 def patch_activity(id: UUID, data: ActivityPatch, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)): return write(db,p,request,key,lambda: domain.patch(db,p,request,Activity,id,data),Activity)

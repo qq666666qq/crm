@@ -34,12 +34,12 @@ export function createSemanticIndex({repo,embed,ready,getModel=async()=> 'text-e
   }
  },abort:async(_current,runtime,context)=>{await status({status:'interrupted'});await runtime.commit(()=>({status:'terminal',outcome:{status:'aborted'}}),context);}});
  const extension=defineExtension({name:'crm.memory.semantic-index',tasks:[task]});
- async function ensure(harness,conversationId){
+ async function ensure(harness,conversationId,{resume=true}={}){
   if(!await enabled())return null;
   const previous=await harness.snapshot(IndexTask,BACKGROUND_CONTEXT);let replace=null;
-  if(previous?.taskId!=null){const record=await harness.getTask(previous.taskId,BACKGROUND_CONTEXT);if(!record||record.state.status==='terminal')replace=previous.taskId;else {harness.resume();return previous.taskId;}}
+  if(previous?.taskId!=null){const record=await harness.getTask(previous.taskId,BACKGROUND_CONTEXT);if(!record||record.state.status==='terminal')replace=previous.taskId;else {if(resume)harness.resume();return previous.taskId;}}
   const id=await harness.commit(async tx=>{const doc=await tx.doc(IndexTask);if(doc.taskId==null||(replace!=null&&doc.taskId===replace))doc.taskId=await tx.createTask(task,{}, {ownership:{kind:'conversation'},conversationId,background:true});return doc.taskId;},BACKGROUND_CONTEXT);
-  harness.resume();return id;
+  if(resume)harness.resume();return id;
  }
  async function getStatus(){try{return JSON.parse(await repo.metadata('semantic_index_status')||'{}');}catch{return {};}}
  async function stop(harness){const doc=await harness.snapshot(IndexTask,BACKGROUND_CONTEXT);if(doc?.taskId!=null){const record=await harness.getTask(doc.taskId,BACKGROUND_CONTEXT);if(record&&record.state.status!=='terminal'){await harness.abortTask(doc.taskId,BACKGROUND_CONTEXT);await harness.waitForTask(doc.taskId,BACKGROUND_CONTEXT);}}await status({status:'disabled'});}

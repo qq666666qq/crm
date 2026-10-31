@@ -1,6 +1,6 @@
 import React, {useState} from 'react';
 import { ArrowRight, Globe2 } from 'lucide-react';
-type Tenant = {id:string;name:string;role:string};
+import type {Tenant} from './sessionTypes';
 type Mode = 'login'|'register'|'verify'|'forgot'|'reset';
 export function Login({onLogin}:{onLogin:(items:Tenant[])=>void}) {
   const [mode,setMode]=useState<Mode>('login'),[email,setEmail]=useState(''),[password,setPassword]=useState(''),[name,setName]=useState(''),[tenantId,setTenantId]=useState(''),[code,setCode]=useState(''),[error,setError]=useState(''),[notice,setNotice]=useState(''),[busy,setBusy]=useState(false);

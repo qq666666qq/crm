@@ -13,7 +13,7 @@ from app.errors import error
 from app.models import Company, Contact, Membership, User, AuditLog, Tenant
 from app.schemas import CompanyFields, CompanyPatch, ContactFields, ContactPatch, Login, MemberCreate, MemberPatch, MemberAttach, Restore, Register, VerifyRegistration, ResetRequest, ResetPassword, ChangePassword, JoinRequest
 from app.security import login, principal, authenticated
-from app import service
+from app import access, service
 from app import members, accounts
 from app.sales_api import router as sales_router
 from app.sync import router as sync_router
@@ -147,7 +147,7 @@ def response(result):
 def list_members(p=Depends(principal), db: Session = Depends(get_db)):
     members.require_manager(db, p)
     query = select(Membership, User).join(User, User.id == Membership.user_id).where(Membership.tenant_id == p.membership.tenant_id)
-    if p.membership.role != 'admin': query = query.where(Membership.user_id.in_(service.scope_ids(p)), ((Membership.status != 'pending') | (Membership.manager_id == p.user.id)))
+    if p.membership.role != 'admin': query = query.where(Membership.user_id.in_(access.scope_ids(p)), ((Membership.status != 'pending') | (Membership.manager_id == p.user.id)))
     rows = db.execute(query.order_by(User.email))
     return {'items': [members.serialize(member, user) for member, user in rows]}
 
@@ -191,7 +191,7 @@ def restore_contact(id: uuid.UUID, data: Restore, request: Request, key: str | N
 @app.get('/api/v1/companies')
 def companies(q: str = '', limit: int = 50, offset: int = 0, country: str | None = None, industry: str | None = None, p=Depends(principal), db: Session = Depends(get_db)):
     if not 1 <= limit <= 100 or offset < 0: raise error(422, 'VALIDATION_ERROR', 'Invalid pagination')
-    query = service.company_query(p)
+    query = access.company_query(p)
     if country: query = query.where(Company.country == country)
     if industry: query = query.where(Company.industry == industry)
     if q: query = query.where(Company.name.ilike('%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%', escape='\\'))
@@ -202,7 +202,7 @@ def companies(q: str = '', limit: int = 50, offset: int = 0, country: str | None
 def company_duplicate_candidates(name: str, country: str | None = None, p=Depends(principal), db: Session = Depends(get_db)):
     from sqlalchemy import func
     if not name.strip() or len(name) > 255 or (country is not None and len(country) > 100): raise error(422, 'VALIDATION_ERROR', 'Invalid name or country')
-    query = service.company_query(p).where(func.lower(Company.name) == name.strip().lower())
+    query = access.company_query(p).where(func.lower(Company.name) == name.strip().lower())
     if country: query = query.where(func.lower(Company.country) == country.strip().lower())
     return {'classification': 'possible_duplicate', 'items': [service.output(x) for x in db.scalars(query.order_by(Company.id).limit(100))]}
 
@@ -214,22 +214,22 @@ def create_company(data: CompanyFields, request: Request, key: str | None = Head
 
 @app.get('/api/v1/companies/{id}')
 def company(id: uuid.UUID, p=Depends(principal), db: Session = Depends(get_db)):
-    return service.output_with_owner(db, p, [service.get_company(db, p, id)])[0]
+    return service.output_with_owner(db, p, [access.get_company(db, p, id)])[0]
 
 
 @app.patch('/api/v1/companies/{id}')
 def update_company(id: uuid.UUID, data: CompanyPatch, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)):
-    return response(service.write(db, p, request, key, lambda: service.modify(db, p, request, service.get_company(db, p, id, True), data.model_dump(exclude_unset=True))))
+    return response(service.write(db, p, request, key, lambda: service.modify(db, p, request, access.get_company(db, p, id, True), data.model_dump(exclude_unset=True))))
 
 
 @app.delete('/api/v1/companies/{id}')
 def delete_company(id: uuid.UUID, request: Request, expected_version: int, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)):
-    return response(service.write(db, p, request, key, lambda: service.modify(db, p, request, service.get_company(db, p, id, True), {'expected_version': expected_version}, True)))
+    return response(service.write(db, p, request, key, lambda: service.modify(db, p, request, access.get_company(db, p, id, True), {'expected_version': expected_version}, True)))
 
 
 @app.get('/api/v1/companies/{id}/contacts')
 def contacts(id: uuid.UUID, limit: int | None = None, offset: int = 0, q: str = '', p=Depends(principal), db: Session = Depends(get_db)):
-    service.get_company(db, p, id)
+    access.get_company(db, p, id)
     if offset < 0 or (limit is not None and not 1 <= limit <= 100): raise error(422, 'VALIDATION_ERROR', 'Invalid pagination')
     query = select(Contact).where(Contact.tenant_id == p.membership.tenant_id, Contact.company_id == id, Contact.deleted_at.is_(None)).order_by(Contact.created_at, Contact.id).offset(offset)
     if q: query = query.where(Contact.name.ilike('%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%', escape='\\'))
@@ -239,20 +239,20 @@ def contacts(id: uuid.UUID, limit: int | None = None, offset: int = 0, q: str = 
 
 @app.post('/api/v1/companies/{id}/contacts')
 def create_contact(id: uuid.UUID, data: ContactFields, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)):
-    service.get_company(db, p, id)
+    access.get_company(db, p, id)
     return response(service.write(db, p, request, key, lambda: service.create(db, p, request, Contact, data.model_dump(), id)))
 
 
 @app.get('/api/v1/contacts/{id}')
 def contact(id: uuid.UUID, p=Depends(principal), db: Session = Depends(get_db)):
-    return service.output(service.get_contact(db, p, id))
+    return service.output(access.get_contact(db, p, id))
 
 
 @app.patch('/api/v1/contacts/{id}')
 def update_contact(id: uuid.UUID, data: ContactPatch, request: Request, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)):
-    return response(service.write(db, p, request, key, lambda: service.modify(db, p, request, service.get_contact(db, p, id, True), data.model_dump(exclude_unset=True))))
+    return response(service.write(db, p, request, key, lambda: service.modify(db, p, request, access.get_contact(db, p, id, True), data.model_dump(exclude_unset=True))))
 
 
 @app.delete('/api/v1/contacts/{id}')
 def delete_contact(id: uuid.UUID, request: Request, expected_version: int, key: str | None = Header(None, alias='Idempotency-Key'), p=Depends(principal), db: Session = Depends(get_db)):
-    return response(service.write(db, p, request, key, lambda: service.modify(db, p, request, service.get_contact(db, p, id, True), {'expected_version': expected_version}, True)))
+    return response(service.write(db, p, request, key, lambda: service.modify(db, p, request, access.get_contact(db, p, id, True), {'expected_version': expected_version}, True)))

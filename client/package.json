@@ -7,7 +7,7 @@
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron electron/main.cjs\"",
     "build": "tsc --noEmit && vite build",
     "start": "electron electron/main.cjs --production",
-    "test": "vitest run src && node --test electron/crm-transport.test.cjs electron/sync-stream.test.cjs electron/agent-actions.test.cjs electron/session-check.cjs electron/session-cache.test.cjs electron/agent-key.test.cjs electron/module-store.test.cjs electron/module-records.test.cjs electron/mock-sync.test.cjs electron/background-runner.test.cjs electron/dataset-export.test.cjs electron/trace-export.test.cjs electron/trace-archive.test.cjs electron/langfuse-export.test.cjs electron/langfuse-queue.test.cjs electron/legacy-session.test.cjs electron/agent-crm.test.cjs electron/agent-approvals.test.cjs && npm run test:agent",
+    "test": "vitest run src && node --test electron/crm-transport.test.cjs electron/sync-stream.test.cjs electron/agent-actions.test.cjs electron/agent-host.test.cjs electron/approval-executor.test.cjs electron/session-check.cjs electron/session-cache.test.cjs electron/agent-key.test.cjs electron/module-store.test.cjs electron/module-records.test.cjs electron/mock-sync.test.cjs electron/background-runner.test.cjs electron/dataset-export.test.cjs electron/trace-export.test.cjs electron/trace-archive.test.cjs electron/langfuse-export.test.cjs electron/langfuse-queue.test.cjs electron/legacy-session.test.cjs electron/agent-crm.test.cjs electron/agent-approvals.test.cjs && npm run test:agent",
     "test:agent": "node --test agent/*.test.mjs agent/memory/*.test.mjs",
     "test:pi-live": "node scripts/pi-live-smoke.mjs"
   },
