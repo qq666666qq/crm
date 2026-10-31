@@ -2,7 +2,8 @@ from sqlalchemy import select
 from app.errors import error
 from app.models import Tenant, User, Membership
 from app.security import passwords
-from app.service import audit, scope_ids
+from app.service import scope_ids
+from app.change_journal import record_customer_change as audit
 
 
 def require_admin(db, p, lock=False):

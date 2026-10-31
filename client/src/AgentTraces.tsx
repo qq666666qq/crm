@@ -1,0 +1,6 @@
+import React, {useState} from 'react';
+
+export function AgentTracesPanel({approvalCounts,onError}:{approvalCounts:ReadonlyMap<string,number>;onError:(message:string)=>void}) {
+  const [traces,setTraces]=useState<any[]>([]);
+  return <details className="agent-control-card agent-collapsible"><summary className="agent-card-summary"><span className="agent-card-title">执行记录</span><span className="agent-card-status">{traces.length?`${traces.length} 条已加载`:'查看记录'}</span><span className="agent-card-chevron" aria-hidden="true">⌄</span></summary><div className="agent-card-content"><div className="agent-control-heading"><div><h3>执行记录</h3><p>导出会读取本机保存的对话和工具过程；历史记录只包含当时实际保存的内容。</p></div></div><button className="button secondary" onClick={()=>void window.crm.agent('traces').then(setTraces).catch(()=>onError('无法读取执行记录。'))}>刷新记录</button><button className="button secondary" onClick={()=>void window.crm.exportTraces().catch(()=>onError('执行记录导出失败。'))}>导出执行记录</button>{traces.map(t=><p key={t.id}>{new Date(t.started_at).toLocaleString()} · {({completed:'已完成',failed:'失败',interrupted:'已中断',running:'进行中'} as Record<string,string>)[t.status]||t.status} · 关联审批 {approvalCounts.get(t.id)||0} 条{t.status==='interrupted'&&'（任务不会自动重放）'}</p>)}</div></details>;
+}

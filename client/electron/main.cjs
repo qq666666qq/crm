@@ -13,16 +13,16 @@ const fs = require('node:fs/promises');
 const {readPath} = require('./agent-crm.cjs');
 const {approvalStore} = require('./agent-approvals.cjs');
 const {agentDatabaseKey} = require('./agent-key.cjs');
+const {dispatchAgentAction} = require('./agent-actions.cjs');
+const {createSyncStream} = require('./sync-stream.cjs');
+const {createCrmTransport} = require('./crm-transport.cjs');
 const path = require('node:path');
 const {createHash, randomUUID} = require('node:crypto');
 
 const api = new URL(process.env.CRM_API_URL || 'http://127.0.0.1:8000');
 if (!['https:', 'http:'].includes(api.protocol) || api.username || api.password || (api.protocol !== 'https:' && !['localhost', '127.0.0.1', '::1', '[::1]'].includes(api.hostname))) throw new Error('CRM_API_URL must use HTTPS, except for loopback development');
-let windowRef, token = null, tenant = null, userId = null, generation = 0, streamAbort = null, agent = null, agentPrivate = false;
+let windowRef, token = null, tenant = null, userId = null, generation = 0, agent = null, agentPrivate = false;
 let agentStopping = Promise.resolve();
-const pending = new Set();
-// Preserve the key for an identical retry after an uncertain network outcome.
-const retryKeys = new Map();
 const approvalsInFlight = new Set();
 const mockBackground=backgroundRunner({run:(target,key)=>mockSyncStore().run(target,key)});
 const runDetails = createLangfuseQueue(detail=>{const cfg=langfuseSettings();return uploadLangfuse(buildLangfusePayload(detail,langfuseBuildOpts(cfg)),cfg);});
@@ -35,7 +35,7 @@ const traceArchive=createTraceArchive({
 });
 
 function send(channel, data) { if (windowRef && !windowRef.isDestroyed()) windowRef.webContents.send(channel, data); }
-function clearRequests() { generation++; for (const c of pending) c.abort(); pending.clear(); if (streamAbort) streamAbort.abort(); streamAbort = null; }
+function clearRequests() { generation++; transport.reset(); syncStream.stop(); }
 function stopAgent() {
   const child=agent;if(!child)return agentStopping;agent=null;
   const stopped=new Promise(resolve=>{let done=false;const finish=()=>{if(done)return;done=true;clearTimeout(timer);resolve();};const timer=setTimeout(()=>{try{child.kill();}catch{}},10000);child.once('exit',finish);try{child.postMessage({type:'close'});}catch{try{child.kill();}catch{}}});
@@ -53,7 +53,7 @@ function langfuseBuildOpts(cfg){return {userId:tenant&&userId?createHash('sha256
 async function storeRunDetail(detail){if(!detail||typeof detail.id!=='string'||!detail.id)return;runDetails.add(detail);send('crm:langfuse-status',{pending:runDetails.pending()});const cfg=langfuseSettings();if(!cfg.autoUpload||!langfuseConfigured())return;const current=generation,result=await runDetails.upload(detail.id);if(current===generation)send('crm:langfuse-status',{ok:result.ok,error:result.error||null,pending:runDetails.pending()});}
 async function handleSavedTrace(id){const current=generation,cfg=langfuseSettings();if(cfg.autoUpload&&langfuseConfigured()){const result=await traceArchive.uploadOne(id);if(current===generation)send('crm:langfuse-status',{ok:result.ok,error:result.error||null});}else if(current===generation)send('crm:langfuse-status',{});}
 async function langfuseStatus(){const cfg=langfuseSettings(),saved=await traceArchive.status();return {configured:langfuseConfigured(),baseUrl:cfg.baseUrl||'',autoUpload:cfg.autoUpload,pending:saved.pending+runDetails.pending(),lastError:traceStorageError||saved.lastError||runDetails.lastError()};}
-function clearSession(forget = false) { mockBackground.stop(); stopAgent(); agentPrivate=false; clearRequests(); retryKeys.clear(); runDetails.clear(); langfuseConfig=null; traceStorageError=null; token = null; tenant = null; userId = null; if (forget) { try { cache().clear(); } catch {} } }
+function clearSession(forget = false) { mockBackground.stop(); stopAgent(); agentPrivate=false; clearRequests(); runDetails.clear(); langfuseConfig=null; traceStorageError=null; token = null; tenant = null; userId = null; if (forget) { try { cache().clear(); } catch {} } }
 async function startAgent() {
   if (!token || !tenant || !userId) throw new Error('Authentication required');
   const requestedGeneration=generation;let stopTimeout;
@@ -102,94 +102,20 @@ async function agentRequest(type, payload={}) {
   });
 }
 function trusted(event) { if (!windowRef || event.sender !== windowRef.webContents) throw new Error('Unauthorized IPC sender'); }
-function endpoint(pathname) {
-  if (typeof pathname !== 'string' || !pathname.startsWith('/api/v1/') || pathname.startsWith('/api/v1//') || pathname.includes('\\')) throw new Error('Invalid API path');
-  const url = new URL(pathname, api);
-  if (url.origin !== api.origin || !url.pathname.startsWith('/api/v1/')) throw new Error('Invalid API destination');
-  return url;
-}
-async function call(pathname, method = 'GET', body, activeToken = token, activeTenant = tenant, agentWrite = null) {
-  if (!['GET','POST','PATCH','DELETE'].includes(method)) throw new Error('Invalid HTTP method');
-  const controller = new AbortController(); pending.add(controller);
-  const current = generation;
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    const headers = { Accept: 'application/json' };
-    if (activeToken) headers.Authorization = `Bearer ${activeToken}`;
-    if (activeTenant) headers['X-Tenant-ID'] = activeTenant;
-    if (body !== undefined) headers['Content-Type'] = 'application/json';
-    let retryKey;
-    if (method !== 'GET' && !pathname.startsWith('/api/v1/auth/')) {
-      if(agentWrite){headers['Idempotency-Key']=agentWrite.id;headers['X-Operation-Source']='agent';if(agentWrite.runId)headers['X-Agent-Run-ID']=agentWrite.runId;}
-      else {
-        retryKey = JSON.stringify([activeTenant, method, pathname, body]);
-        if (!retryKeys.has(retryKey)) {
-          if (retryKeys.size >= 100) throw new Error('Too many unresolved requests; reconnect before retrying');
-          retryKeys.set(retryKey, require('node:crypto').randomUUID());
-        }
-        headers['Idempotency-Key'] = retryKeys.get(retryKey);
-      }
-    }
-    const result = await fetch(endpoint(pathname), { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal, redirect: 'error' });
-    const data = await result.json().catch(() => ({}));
-    if (current !== generation) throw new Error('Session changed');
-    if (retryKey && result.status < 500) retryKeys.delete(retryKey);
-    if (!result.ok) {
-      if (result.status === 401 && !pathname.endsWith('/auth/login')) { clearSession(true); send('crm:revoked', {}); }
-      if (result.status === 403 && !pathname.endsWith('/auth/me')) send('crm:permission', {});
-      return { ok: false, status: result.status, error: data.error || { code: 'INTERNAL_ERROR', message: '请求失败' } };
-    }
-    return { ok: true, data };
-  } finally { clearTimeout(timer); pending.delete(controller); }
-}
-async function subscribe() {
-  if (!token || !tenant) return;
-  const controller = new AbortController(); streamAbort = controller;
-  const version = generation; let cursor = null; let retry = 1000;
-  while (!controller.signal.aborted && version === generation) {
-    const attempt = new AbortController();
-    const cancelAttempt = () => attempt.abort();
-    controller.signal.addEventListener('abort', cancelAttempt, { once: true });
-    try {
-      const headers = { Authorization: `Bearer ${token}`, 'X-Tenant-ID': tenant, Accept: 'text/event-stream' };
-      if (cursor !== null) headers['Last-Event-ID'] = String(cursor);
-      const response = await fetch(endpoint('/api/v1/sync/events'), { headers, signal: attempt.signal, redirect: 'error' });
-      if (response.status === 401 || response.status === 403) { clearSession(true); send('crm:revoked', {}); return; }
-      if (!response.ok || !response.body) throw new Error('Sync unavailable');
-      send('crm:connection', 'connected'); retry = 1000;
-      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
-      while (!controller.signal.aborted) {
-        let timer;
-        const part = await Promise.race([reader.read(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Sync heartbeat timed out')), 45000); })]).finally(() => clearTimeout(timer));
-        if (part.done) break;
-        buffer += decoder.decode(part.value, { stream: true }).replace(/\r\n/g, '\n');
-        if (buffer.length > 1024 * 1024) throw new Error('Sync buffer limit exceeded');
-        let boundary;
-        while ((boundary = buffer.indexOf('\n\n')) >= 0) {
-          const block = buffer.slice(0, boundary); buffer = buffer.slice(boundary + 2);
-          let event = 'message', id = null, payload = '';
-          for (const line of block.split('\n')) {
-            if (line.startsWith('event:')) event = line.slice(6).trim();
-            else if (line.startsWith('id:')) id = line.slice(3).trim();
-            else if (line.startsWith('data:')) payload += line.slice(5).trimStart();
-          }
-          if (event === 'revoked') { clearSession(true); send('crm:revoked', {}); return; }
-          if (event === 'changes') {
-            try { const data = JSON.parse(payload); if (!Array.isArray(data.events) || !Number.isSafeInteger(data.cursor)) throw new Error('Invalid event'); send('crm:sync', data); if (id && /^\d+$/.test(id)) cursor = Number(id); }
-            catch { cursor = null; send('crm:sync', { reset: true, events: [] }); }
-          }
-        }
-      }
-      await reader.cancel().catch(() => {});
-      if (!controller.signal.aborted) throw new Error('Connection closed');
-    } catch (err) {
-      attempt.abort();
-      if (controller.signal.aborted || version !== generation) return;
-      send('crm:connection', 'reconnecting'); send('crm:sync', { reset: false, events: [{ action: 'resync' }] });
-      await new Promise(resolve => setTimeout(resolve, retry)); retry = Math.min(retry * 2, 15000);
-    } finally { attempt.abort(); controller.signal.removeEventListener('abort', cancelAttempt); }
-  }
-}
+const transport = createCrmTransport({
+  api,
+  session: () => ({token,tenant,generation}),
+  fetch: (...args) => fetch(...args),
+  onRevoked: () => { clearSession(true); send('crm:revoked', {}); },
+  onPermission: () => send('crm:permission', {}),
+});
+const call = transport.call;
+const syncStream = createSyncStream({
+  connect: transport.openSync,
+  onConnection: state => send('crm:connection', state),
+  onSync: data => send('crm:sync', data),
+  onRevoked: () => { clearSession(true); send('crm:revoked', {}); },
+});
 
 Menu.setApplicationMenu(null);
 const primaryInstance=app.requestSingleInstanceLock();
@@ -224,9 +150,9 @@ if(primaryInstance)app.whenReady().then(() => {
   ipcMain.handle('crm:tenants', async event => { trusted(event); if (!token) throw new Error('Authentication required'); return call('/api/v1/auth/tenants', 'GET', undefined, token, null); });
   ipcMain.handle('crm:select-tenant', async (event, id) => {
     trusted(event); if (!token || typeof id !== 'string') throw new Error('Authentication required');
-    mockBackground.stop(); stopAgent(); agentPrivate=false; userId = null; clearRequests(); retryKeys.clear(); runDetails.clear(); langfuseConfig=null; traceStorageError=null; tenant = id;
+    mockBackground.stop(); stopAgent(); agentPrivate=false; userId = null; clearRequests(); runDetails.clear(); langfuseConfig=null; traceStorageError=null; tenant = id;
     const me = await call('/api/v1/auth/me');
-    if (me.ok) { userId = me.data.user_id; cache().save(token, tenant); subscribe(); resumeMockBackground(); } else tenant = null;
+    if (me.ok) { userId = me.data.user_id; cache().save(token, tenant); syncStream.start({token,tenant}); resumeMockBackground(); } else tenant = null;
     return me;
   });
   ipcMain.handle('crm:restore-session', async event => {
@@ -240,7 +166,7 @@ if(primaryInstance)app.whenReady().then(() => {
       if (!list.data.items.some(item => item.id === tenant)) { clearSession(true); return {ok:false,status:403,error:{code:'FORBIDDEN',message:'企业权限已失效'}}; }
       const me = await call('/api/v1/auth/me');
       if (!me.ok) { if (me.status === 401 || me.status === 403) clearSession(true); else clearSession(); return me; }
-      userId = me.data.user_id; subscribe(); resumeMockBackground();
+      userId = me.data.user_id; syncStream.start({token,tenant}); resumeMockBackground();
       return {ok:true,data:{tenants:list.data.items,tenant_id:tenant,user:me.data}};
     } catch { clearSession(); return {ok:false,status:503,error:{code:'NETWORK_ERROR',message:'无法连接服务器，请检查网络后重试'}}; }
   });
@@ -306,44 +232,10 @@ if(primaryInstance)app.whenReady().then(() => {
   ipcMain.handle('crm:agent', async (event, action, value) => {
     trusted(event);
     if (!token || !tenant || !userId) throw new Error('Authentication required');
-    if (action==='presets') return agentRequest('presets');
-    if (action==='history') return agentRequest('history');
-    if (action==='migration-status') return agentRequest('migration-status');
-    if (action==='conversations'||action==='new-conversation') return agentRequest(action);
-    if (action==='select-conversation' && typeof value==='string' && value.length<=100) return agentRequest(action,{conversationId:value});
-    if (action==='evolve' && typeof value==='string' && value.length<=100) return agentRequest(action,{traceId:value});
-    if (action==='evolution-history' && typeof value==='string' && /^\d{1,20}$/.test(value)) return agentRequest('evolution-history',{traceId:value});
-    if (action==='evolution-tasks') return agentRequest('evolution-tasks');
-    if (action==='evolution-decide' && value && typeof value==='object' && typeof value.id==='string' && /^[0-9a-f-]{36}$/i.test(value.id) && Number.isSafeInteger(value.expectedVersion) && value.expectedVersion>0 && ['baseline','candidate'].includes(value.decision)) return agentRequest('evolution-decide',{value:{id:value.id,expectedVersion:value.expectedVersion,decision:value.decision}});
-    if (action==='traces') return agentRequest('traces');
-    if (action==='memory-status') return agentRequest('memory-status');
-    if (action==='memory-page' && value && typeof value==='object' && ['active','pending'].includes(value.status) && (value.cursor===null || typeof value.cursor==='string' && value.cursor.length>0 && value.cursor.length<=512)) return agentRequest('memory-page',{value:{status:value.status,cursor:value.cursor}});
-    if (action==='memory-skills' && Array.isArray(value) && value.length<=5 && value.every(name=>typeof name==='string' && name.length>0 && name.length<=100)) return agentRequest('memory-skills',{value:[...value]});
-    if (action==='memory-sources' && typeof value==='string' && /^[0-9a-f-]{36}$/i.test(value)) return agentRequest('memory-sources',{value});
-    if (action==='memory-review' && value && typeof value==='object' && typeof value.id==='string' && /^[0-9a-f-]{36}$/i.test(value.id) && Number.isSafeInteger(value.expectedVersion) && value.expectedVersion>0 && ['accept','reject'].includes(value.decision) && (value.confirmedConflicts===undefined || Array.isArray(value.confirmedConflicts) && value.confirmedConflicts.length<=10 && value.confirmedConflicts.every(item=>item && typeof item.id==='string' && /^[0-9a-f-]{36}$/i.test(item.id) && Number.isSafeInteger(item.version) && item.version>0 && ['active','pending'].includes(item.status)))) return agentRequest('memory-review',{value:{id:value.id,expectedVersion:value.expectedVersion,decision:value.decision,confirmedConflicts:value.confirmedConflicts?.map(item=>({id:item.id,version:item.version,status:item.status}))}});
-    if (action==='memory-update' && value && typeof value==='object' && typeof value.id==='string' && /^[0-9a-f-]{36}$/i.test(value.id) && Number.isSafeInteger(value.expectedVersion) && value.expectedVersion>0 && ['edit','delete'].includes(value.operation) && (value.operation==='delete'||typeof value.content==='string'&&value.content.trim()&&value.content.length<=4000)) return agentRequest('memory-update',{value:{id:value.id,expectedVersion:value.expectedVersion,operation:value.operation,content:value.operation==='edit'?value.content:undefined}});
-    if (action==='memory-search' && typeof value==='string' && value.trim() && value.length<=200) return agentRequest('memory-search',{value});
-    if (action==='memory-semantic-model' && typeof value==='string' && /^[a-zA-Z0-9._-]{1,100}$/.test(value)) return agentRequest('memory-semantic-model',{value});
-    if (action==='memory-semantic' && typeof value==='boolean') return agentRequest('memory-semantic',{value});
-    if (action==='memory-retry' && value && typeof value==='object' && typeof value.submissionId==='string' && /^\d{1,20}$/.test(value.submissionId) && ['writer','reflection','harvest'].includes(value.kind)) return agentRequest('memory-retry',{value:{submissionId:value.submissionId,kind:value.kind}});
-    if (action==='memory-harvest' && typeof value==='string' && /^\d{1,20}$/.test(value)) return agentRequest('memory-harvest',{value});
-    if (action==='memory-publish' && value && typeof value==='object' && typeof value.id==='string' && /^[0-9a-f-]{36}$/i.test(value.id) && typeof value.digest==='string' && /^[0-9a-f]{64}$/i.test(value.digest)) return agentRequest('memory-publish',{value:{id:value.id,digest:value.digest}});
-    if (action==='memory-reject' && value && typeof value==='object' && typeof value.id==='string' && /^[0-9a-f-]{36}$/i.test(value.id) && typeof value.digest==='string' && /^[0-9a-f]{64}$/i.test(value.digest)) return agentRequest('memory-reject',{value:{id:value.id,digest:value.digest}});
-    if (action==='memory-rollback' && value && typeof value==='object' && typeof value.id==='string' && /^[0-9a-f-]{36}$/i.test(value.id) && Number.isSafeInteger(value.expectedVersion) && value.expectedVersion>0) return agentRequest('memory-rollback',{value:{id:value.id,expectedVersion:value.expectedVersion}});
     if (action==='privacy-status') return {private:agentPrivate};
     if (action==='legacy-location') {const scope=createHash('sha256').update(`${tenant}:${userId}`).digest('hex');return inspectLegacy(path.join(app.getPath('userData'),'agent',scope,'session.sqlite'));}
     if (action==='privacy-mode' && typeof value==='boolean') { stopAgent();agentPrivate=value;return {private:agentPrivate}; }
-    if (action==='demo-lead') return agentRequest('demo-lead');
-    if (action==='configure-model' && typeof value==='string' && value.length>=10 && value.length<=512) return agentRequest('configure-model',{key:value});
-    if (action==='chat' && typeof value==='string' && value.trim() && value.length<=8000) return agentRequest('chat',{text:value});
-    if (action==='select-preset' && ['lead-opportunity','rag','creator'].includes(value)) return agentRequest('select-preset',{preset:value});
-    if (action==='demo-search' && typeof value==='string' && value.length<=500) return agentRequest('demo-search',{query:value});
-    if (action==='harness2-state') return agentRequest('harness2-state');
-    if (action==='harness2-history') return agentRequest('harness2-history',{limit:100});
-    if (action==='harness2-run' && Array.isArray(value) && value.length>=1 && value.length<=10 && value.every(task=>task&&typeof task==='object'&&!Array.isArray(task)&&typeof task.id==='string'&&task.id.length<=100&&typeof task.input==='string'&&task.input.length<=4000&&typeof task.expected==='string'&&task.expected.trim()&&task.expected.length<=300&&(task.domain===undefined||typeof task.domain==='string'))) return agentRequest('harness2-run',{tasks:value});
-    if (action==='harness2-promote' && typeof value==='string' && /^cand_[0-9a-f-]{36}$/i.test(value)) return agentRequest('harness2-promote',{candidateId:value});
-    if (action==='harness2-rollback' && typeof value==='string' && /^exp_[0-9a-f-]{36}$/i.test(value)) return agentRequest('harness2-rollback',{entryId:value});
-    throw new Error('Invalid agent action');
+    return dispatchAgentAction(action,value,agentRequest);
   });
 });
 app.on('window-all-closed', () => { clearSession(); void agentStopping.finally(()=>app.quit()); });

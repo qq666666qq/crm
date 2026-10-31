@@ -2,10 +2,10 @@
 from datetime import datetime, timezone
 from sqlalchemy import select, or_, func
 from app.errors import error
-from app.models import AuditLog, Company, Contact
+from app.models import Company, Contact
 from app.phase2_models import Lead, LeadEvidence, Opportunity, OpportunityContact, FollowUpTask, Activity
 from app import service
-from fastapi.encoders import jsonable_encoder
+from app.change_journal import record_sales_change as record
 from pydantic import ValidationError
 from app.sales_schemas import LeadData, OpportunityData, TaskData, ActivityData
 
@@ -50,12 +50,6 @@ def validate_links(db, p, fields, lock=False):
     if lead and opportunity and opportunity.originating_lead_id and lead.id != opportunity.originating_lead_id:
         raise error(409, 'VALIDATION_ERROR', 'Lead does not match the opportunity')
     return company, contact, lead, opportunity, task
-
-
-def record(db, p, request, action, obj, fields, changes=None):
-    db.add(AuditLog(tenant_id=p.membership.tenant_id, actor_id=p.user.id, action=action, object_type=obj.__tablename__, object_id=obj.id, changed_fields=list(fields), changes=jsonable_encoder(changes) if changes else None, request_id=request.state.request_id, source=request.headers.get('X-Operation-Source') if request.headers.get('X-Operation-Source') in ('human', 'agent') else 'human', agent_run_id=(request.headers.get('X-Agent-Run-ID') or '')[:100] or None))
-    from app.outbox import emit
-    emit(db, obj, action, changes)
 
 
 def create(db, p, request, model, data):

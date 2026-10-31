@@ -7,8 +7,9 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.errors import error
-from app.models import AuditLog, Company, Contact, Idempotency, Membership, User
+from app.models import Company, Contact, Idempotency, Membership, User
 from app.schemas import ContactFields
+from app.change_journal import record_customer_change as audit
 
 
 def domain(website):
@@ -72,12 +73,6 @@ def output_with_owner(db, p, objects):
         if owner_id: item['owner_name'] = names.get(owner_id)
         result.append(item)
     return result
-
-
-def audit(db, p, request, action, obj, fields, changes=None):
-    db.add(AuditLog(tenant_id=p.membership.tenant_id, actor_id=p.user.id, action=action, object_type=obj.__tablename__, object_id=obj.id, changed_fields=list(fields), request_id=request.state.request_id, source=request.headers.get('X-Operation-Source', 'human') if request.headers.get('X-Operation-Source', 'human') in ('human', 'agent') else 'human', agent_run_id=(request.headers.get('X-Agent-Run-ID') or '')[:100] or None))
-    from app.outbox import emit
-    emit(db, obj, action, changes)
 
 
 def owner(db, p, owner_id):
