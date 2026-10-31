@@ -5,7 +5,25 @@ from sqlalchemy import select
 from test_integration import env
 from app import accounts
 from app.models import Membership, User, LoginSession, Company
-from app.security import passwords
+from app.security import passwords, token_hash
+
+
+def test_session_renews_only_while_valid_and_never_after_logout(env):
+    client, sessions, (tenant, _, _, _), auth = env
+    headers = auth('admin@example.com', tenant)
+    digest = token_hash(headers['Authorization'].split()[1])
+    with sessions.begin() as db:
+        db.get(LoginSession, digest).expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    assert client.get('/api/v1/auth/me', headers=headers).status_code == 200
+    with sessions() as db:
+        assert db.get(LoginSession, digest).expires_at > datetime.now(timezone.utc) + timedelta(hours=11)
+    assert client.post('/api/v1/auth/logout', headers=headers).status_code == 200
+    assert client.get('/api/v1/auth/me', headers=headers).status_code == 401
+    other = auth('admin@example.com', tenant)
+    other_digest = token_hash(other['Authorization'].split()[1])
+    with sessions.begin() as db:
+        db.get(LoginSession, other_digest).expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    assert client.get('/api/v1/auth/me', headers=other).status_code == 401
 
 
 def test_registration_approval_reset_and_password_change(env, monkeypatch):

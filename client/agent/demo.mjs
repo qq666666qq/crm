@@ -1,0 +1,4 @@
+import {EvidenceRegistry} from './evidence.mjs';
+export const DEMO_DOCS=[{id:'demo-01',title:'示例：客户跟进规范',content:'首次沟通后，应确认采购产品、数量与交付时间，并记录客户原话。',source:'演示资料 01'},{id:'demo-02',title:'示例：报价准备',content:'报价前核对产品规格、采购数量、币种和目的港，信息缺失时向客户确认。',source:'演示资料 02'}];
+export function searchDemo(query){const terms=String(query||'').trim().toLowerCase().split(/\s+/).filter(Boolean);if(!terms.length)return [];return DEMO_DOCS.filter(d=>terms.some(t=>`${d.title} ${d.content}`.toLowerCase().includes(t))).map(d=>({...d,demo:true}));}
+export function sampleLead(){const registry=new EvidenceRegistry(),message={sourceId:'DEMO-MSG-01',text:'Hello, we are looking for 500 storage boxes for our retail stores.'};const evidence=registry.add(message,'500 storage boxes');return {demo:true,title:'演示：收纳盒采购意向',product:'storage boxes',quantity:500,evidence,validation:registry.validate({evidenceId:evidence.id,quantity:500}).status};}

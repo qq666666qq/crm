@@ -7,9 +7,15 @@
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron electron/main.cjs\"",
     "build": "tsc --noEmit && vite build",
     "start": "electron electron/main.cjs --production",
-    "test": "vitest run && node --test electron/session-check.cjs"
+    "test": "vitest run src && node --test electron/session-check.cjs electron/session-cache.test.cjs electron/agent-key.test.cjs electron/module-store.test.cjs electron/module-records.test.cjs electron/mock-sync.test.cjs electron/background-runner.test.cjs electron/dataset-export.test.cjs electron/trace-export.test.cjs electron/trace-archive.test.cjs electron/langfuse-export.test.cjs electron/langfuse-queue.test.cjs electron/legacy-session.test.cjs electron/agent-crm.test.cjs electron/agent-approvals.test.cjs && npm run test:agent",
+    "test:agent": "node --test agent/*.test.mjs agent/memory/*.test.mjs",
+    "test:pi-live": "node scripts/pi-live-smoke.mjs"
   },
   "dependencies": {
+    "@earendil-works/chord": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-durable": "1.4.0",
+    "@libsql/client": "0.18.0",
     "@tanstack/react-query": "^5.80.0",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
@@ -20,10 +26,10 @@
     "@types/react-dom": "^18.3.6",
     "@vitejs/plugin-react": "^4.4.1",
     "concurrently": "^9.1.2",
-    "electron": "^35.3.1",
+    "electron": "43.8.4",
     "typescript": "^5.8.3",
     "vite": "^6.3.5",
-    "vitest": "^3.2.1",
+    "vitest": "^4.1.12",
     "wait-on": "^8.0.3"
   }
 }

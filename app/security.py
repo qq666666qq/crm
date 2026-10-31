@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import Depends, Header, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pwdlib import PasswordHash
-from sqlalchemy import select
+from sqlalchemy import select, update, func
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
@@ -55,6 +55,18 @@ def authenticated(credentials: HTTPAuthorizationCredentials | None = Depends(bea
     if not session or session.revoked_at or session.expires_at <= datetime.now(timezone.utc): raise error(401, 'UNAUTHORIZED', 'Session invalid or expired')
     user = db.get(User, session.user_id)
     if not user or user.status != 'active': raise error(401, 'UNAUTHORIZED', 'User disabled')
+    # Renew only a still-valid, non-revoked session. The conditional UPDATE
+    # prevents a concurrent logout from resurrecting a revoked session.
+    now = datetime.now(timezone.utc)
+    renewed = db.execute(update(LoginSession).where(
+        LoginSession.token_hash == session.token_hash,
+        LoginSession.revoked_at.is_(None), LoginSession.expires_at > now,
+        LoginSession.user_id.in_(select(User.id).where(User.status == 'active')),
+    ).values(expires_at=func.greatest(LoginSession.expires_at, now + timedelta(hours=settings.session_hours))).returning(LoginSession.token_hash)).scalar_one_or_none()
+    if renewed is None:
+        db.rollback()
+        raise error(401, 'UNAUTHORIZED', 'Session invalid or expired')
+    db.commit()
     return user, session
 
 

@@ -1,0 +1,3 @@
+const crypto=require('node:crypto');
+function makeTestStorage(key=crypto.randomBytes(32)){return {isEncryptionAvailable:()=>true,encryptString(text){const nonce=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',key,nonce),body=Buffer.concat([cipher.update(text,'utf8'),cipher.final()]);return Buffer.concat([nonce,cipher.getAuthTag(),body]);},decryptString(data){const decipher=crypto.createDecipheriv('aes-256-gcm',key,data.subarray(0,12));decipher.setAuthTag(data.subarray(12,28));return Buffer.concat([decipher.update(data.subarray(28)),decipher.final()]).toString('utf8');}};}
+module.exports={makeTestStorage};

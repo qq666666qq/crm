@@ -1,5 +1,5 @@
 import React, {useState} from 'react';
-import { ArrowRight, Building2 } from 'lucide-react';
+import { ArrowRight, Globe2 } from 'lucide-react';
 type Tenant = {id:string;name:string;role:string};
 type Mode = 'login'|'register'|'verify'|'forgot'|'reset';
 export function Login({onLogin}:{onLogin:(items:Tenant[])=>void}) {
@@ -19,7 +19,7 @@ export function Login({onLogin}:{onLogin:(items:Tenant[])=>void}) {
     } catch(e){setError(e instanceof Error?e.message:'请求失败，请检查网络。');} finally {setBusy(false);}
   }
   const titles:Record<Mode,string>={login:'登录工作台',register:'注册账号',verify:'验证邮箱并设置密码',forgot:'找回密码',reset:'重置密码'};
-  return <div className="login-page"><div className="login-card"><div className="brand-mark large"><Building2 size={25}/></div><h1>{titles[mode]}</h1><p>{mode==='register'?'填写企业 ID 提交申请，邮箱验证后由管理员审核。':'使用你的 CRM 账号继续。'}</p><form onSubmit={submit}>
+  return <div className="login-page"><div className="login-card"><div className="brand-mark large"><Globe2 size={25}/></div><h1>{titles[mode]}</h1><p>{mode==='register'?'填写企业 ID 提交申请，邮箱验证后由管理员审核。':'使用你的 CRM 账号继续。'}</p><form onSubmit={submit}>
     {['login','register','forgot'].includes(mode)&&<label>邮箱<input type="email" required autoComplete="username" value={email} onChange={e=>setEmail(e.target.value)}/></label>}
     {mode==='register'&&<><label>姓名<input required maxLength={255} value={name} onChange={e=>setName(e.target.value)}/></label><label>企业 ID<input required value={tenantId} onChange={e=>setTenantId(e.target.value)}/></label></>}
     {['verify','reset'].includes(mode)&&<label>邮箱验证码<input required autoComplete="one-time-code" value={code} onChange={e=>setCode(e.target.value)}/></label>}
